@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 
 from .models import DecisionRequest, DecisionResult, OutcomeUpdate
 from .reporting import to_response
-from .rules import make_decision
+from .llm_decision import hybrid_decision
 from .storage import fetch_signal, fetch_signals_by_date, init_db, insert_signal, update_outcome
 from .vision import parse_image_with_gemini
 
@@ -33,7 +33,7 @@ async def parse_image(symbol: str, timeframe: str, image: UploadFile = File(...)
 
 @app.post("/api/v1/decision", response_model=DecisionResult)
 def decision(req: DecisionRequest) -> DecisionResult:
-    return make_decision(req)
+    return hybrid_decision(req)
 
 
 @app.post("/api/v1/signal-from-image")
@@ -46,7 +46,7 @@ async def signal_from_image(
     data = await image.read()
     parsed = parse_image_with_gemini(data, symbol=symbol, timeframe=timeframe)
     req = DecisionRequest(parsed=parsed, position=position)
-    result = make_decision(req)
+    result = hybrid_decision(req)
 
     record = {
         "created_at": datetime.now(timezone.utc).isoformat(),
