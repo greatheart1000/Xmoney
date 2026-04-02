@@ -56,6 +56,7 @@ class ParsedImageSignal(BaseModel):
     avg_down_leg_bars: Optional[int] = Field(default=None, description="Historical average bearish leg duration in bars")
     avg_up_leg_move_pct: Optional[float] = Field(default=None, description="Historical average bullish leg move (ratio)")
     avg_down_leg_move_pct: Optional[float] = Field(default=None, description="Historical average bearish leg move (ratio)")
+    chart_patterns: List[str] = Field(default_factory=list, description="Detected chart patterns, e.g. head_and_shoulders")
     confidence: float = Field(ge=0.0, le=1.0)
     raw_features: Dict[str, str] = Field(default_factory=dict)
 

@@ -83,3 +83,45 @@ def test_hybrid_uses_dual_model_consensus(monkeypatch):
 
     assert result.action.value == "short"
     assert "双模型" in result.reason[0]
+
+
+def test_hybrid_waits_when_dual_models_disagree(monkeypatch):
+    monkeypatch.setattr(
+        "app.llm_decision._collect_model_decisions",
+        lambda req: [
+            (
+                "gemini",
+                DecisionResult(
+                    trend="bearish",
+                    action="short",
+                    reason=["gemini short"],
+                    entry_zone=[1188, 1190],
+                    stop_loss=1192,
+                    take_profit=[1177],
+                    expected_remaining_bars=6,
+                    expected_total_move_pct=-0.02,
+                    confidence=0.8,
+                ),
+            ),
+            (
+                "deepseek",
+                DecisionResult(
+                    trend="neutral",
+                    action="wait",
+                    reason=["deepseek wait"],
+                    confidence=0.7,
+                ),
+            ),
+        ],
+    )
+
+    result = hybrid_decision(
+        DecisionRequest(
+            parsed=_sample_parsed(),
+            market_regime_30m=MarketRegime.bearish,
+            market_regime_15m=MarketRegime.bearish,
+        )
+    )
+
+    assert result.action.value == "wait"
+    assert any("交叉验证存在分歧" in r for r in result.reason)

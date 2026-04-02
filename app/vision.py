@@ -35,6 +35,7 @@ PROMPT = """
   "avg_down_leg_bars": 0,
   "avg_up_leg_move_pct": 0.0,
   "avg_down_leg_move_pct": 0.0,
+  "chart_patterns": ["pattern_a", "pattern_b"],
   "confidence": 0.0,
   "raw_features": {"note": ""}
 }
@@ -70,6 +71,7 @@ def _mock_parse(symbol: str, timeframe: str) -> ParsedImageSignal:
         avg_down_leg_bars=28,
         avg_up_leg_move_pct=0.018,
         avg_down_leg_move_pct=0.026,
+        chart_patterns=["down_channel", "lower_highs"],
         confidence=0.72,
         raw_features={"source": "mock_vision"},
     )

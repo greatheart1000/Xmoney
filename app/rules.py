@@ -128,6 +128,8 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
     p = req.parsed
     trend = _infer_trend(req)
     reason: List[str] = []
+    if p.chart_patterns:
+        reason.append(f"识别到形态: {', '.join(p.chart_patterns[:3])}")
 
     market_dir = _market_direction(req)
     if req.require_market_filter:
