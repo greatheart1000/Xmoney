@@ -27,6 +27,12 @@ def _build_prompt(req: DecisionRequest) -> str:
     payload = req.model_dump(mode="json")
     return (
         "你是期货AI决策引擎。请严格按用户规则分析，并输出可执行JSON。"
+        "分析必须覆盖："
+        "1) 先看文华商品指数(30m->15m)过滤方向，再看单品种；"
+        "2) MA、MACD、成交量、持仓量；"
+        "3) 图形形态(chart_patterns)与关键结构位；"
+        "4) 价格斐波那契回调(0.236/0.382/0.5/0.618/0.786)；"
+        "5) 时间斐波那契窗(0.618/1.0/1.618)与波段空间估计。"
         "必须遵循以下用户规则：\n"
         f"{user_rules}\n\n"
         "输入JSON如下：\n"
@@ -128,7 +134,7 @@ def _collect_model_decisions(req: DecisionRequest) -> List[Tuple[str, DecisionRe
 
 
 def _ensemble_decision(model_outputs: List[Tuple[str, DecisionResult]]) -> DecisionResult:
-    # 先按action投票；平票时取最高置信度
+    # 多模型交叉验证：优先一致性，分歧时保持保守
     vote: Dict[SignalAction, int] = {}
     for _, d in model_outputs:
         vote[d.action] = vote.get(d.action, 0) + 1
@@ -140,6 +146,17 @@ def _ensemble_decision(model_outputs: List[Tuple[str, DecisionResult]]) -> Decis
     model_names = ", ".join(name for name, _ in model_outputs)
     merged_reason = [f"模型共识来源: {model_names}"] + chosen.reason
     avg_conf = sum(d.confidence for _, d in model_outputs) / len(model_outputs)
+
+    actions = {d.action for _, d in model_outputs}
+    if len(actions) > 1:
+        return DecisionResult(
+            trend=chosen.trend,
+            action=SignalAction.wait,
+            reason=["多模型交叉验证存在分歧，先观望等待二次确认"] + merged_reason,
+            expected_remaining_bars=chosen.expected_remaining_bars,
+            expected_total_move_pct=chosen.expected_total_move_pct,
+            confidence=max(0.35, avg_conf - 0.15),
+        )
 
     return DecisionResult(**{**chosen.model_dump(), "reason": merged_reason, "confidence": avg_conf})
 

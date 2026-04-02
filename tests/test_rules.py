@@ -62,7 +62,7 @@ def test_bullish_hold_long_with_market_confirmed():
     parsed = ParsedImageSignal(
         symbol="XX",
         timeframe="15m",
-        close=100,
+        close=100.2,
         ma5=101,
         ma10=100.5,
         ma20=100,
