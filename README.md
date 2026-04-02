@@ -63,13 +63,68 @@ body 示例：
     "open_interest": 800000,
     "support_levels": [1177, 1170],
     "resistance_levels": [1189, 1198],
+    "historical_support_levels": [1172, 1168],
+    "historical_resistance_levels": [1204, 1215],
+    "swing_high": 1198,
+    "swing_low": 1177,
+    "leg_start_price": 1198,
+    "leg_elapsed_bars": 26,
+    "avg_up_leg_bars": 20,
+    "avg_down_leg_bars": 28,
+    "avg_up_leg_move_pct": 0.018,
+    "avg_down_leg_move_pct": 0.026,
     "confidence": 0.75,
     "raw_features": {}
   },
   "position": "flat",
-  "risk_per_trade": 0.01
+  "risk_per_trade": 0.01,
+  "market_regime_30m": "bearish",
+  "market_regime_15m": "bearish",
+  "require_market_filter": true
 }
 ```
+
+
+### 4.2.1 市场优先过滤（文华指数）
+
+`/api/v1/decision` 新增以下字段：
+
+- `market_regime_30m`: `bullish | bearish | neutral | unknown`
+- `market_regime_15m`: `bullish | bearish | neutral | unknown`
+- `require_market_filter`: 默认 `true`
+
+策略顺序：
+1. 先用文华指数 30m 定方向；
+2. 再用文华指数 15m 确认不冲突；
+3. 最后才看单品种执行做多/做空/持仓。
+
+若 `require_market_filter=true` 且大盘方向未确认，系统会直接返回 `wait`。
+
+
+### 4.2.2 斐波那契回调（支撑位/压力位）
+
+系统支持从 `swing_high` / `swing_low` 自动计算 Fibonacci 回调位（0.236/0.382/0.5/0.618/0.786），并与原有 `support_levels` / `resistance_levels` 合并用于：
+
+- `entry_zone`（入场区）
+- `stop_loss`（止损）
+- `take_profit`（止盈）
+
+当你没有直接提供支撑/压力时，系统会优先用 Fib 回调位补全。
+
+
+### 4.2.3 斐波那契时间 + 波段空间估计
+
+除了价格回调位，系统还支持时间与空间预测：
+
+- `leg_elapsed_bars`: 当前波段已经运行的K线数量
+- `avg_up_leg_bars` / `avg_down_leg_bars`: 历史上涨/下跌波段平均时长
+- `avg_up_leg_move_pct` / `avg_down_leg_move_pct`: 历史上涨/下跌波段平均涨跌幅
+
+系统会输出：
+- `expected_remaining_bars`: 结合斐波那契时间窗(0.618/1.0/1.618)估计的剩余时间
+- `expected_total_move_pct`: 结合历史波段统计的总涨跌幅参考
+
+同时会把 `historical_support_levels` 与 `historical_resistance_levels` 合并到当前支撑/压力分析中。
 
 ### 4.3 一步生成信号（解析+决策+落库）
 
