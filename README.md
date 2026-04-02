@@ -3,7 +3,7 @@
 该项目实现了你要求的一整套流程（已按“先看文华指数大盘，再看单品种”执行）：
 
 - 图片解析接口（Gemini + Mock 回退）
-- 决策接口（默认 LLM 80% + 规则风控 20%）
+- 决策接口（默认 Gemini + DeepSeek 双模型共识 80% + 规则风控 20%）
 - 规则决策接口（MA/MACD/持仓量 + 斐波那契回调 支撑/压力规则）
 - 信号日志与绩效统计（SQLite）
 - 可视化日报（命中率、盈亏比、回撤 + 权益曲线图 + HTML日报）
@@ -32,11 +32,16 @@ export GEMINI_API_KEY=your_key
 export GEMINI_MODEL=gemini-2.5-pro
 ```
 
+# DeepSeek（可选）
+export DEEPSEEK_API_KEY=your_key
+export DEEPSEEK_MODEL=deepseek-chat
+# 可选，默认 https://api.deepseek.com/chat/completions
+export DEEPSEEK_BASE_URL=https://api.deepseek.com/chat/completions
 
 ### 3.1 LLM决策权重与规则注入
 
 系统默认采用：
-- **80% 大模型分析**
+- **80% 双模型（Gemini + DeepSeek）分析**
 - **20% 规则风控兜底**
 
 用户规则注入来源（优先级）：
