@@ -8,7 +8,12 @@ from fastapi.responses import FileResponse
 
 from .models import DecisionRequest, DecisionResult, OutcomeUpdate
 from .reporting import to_response
-from .llm_decision import hybrid_decision, hybrid_decision_from_images
+from .llm_decision import (
+    hybrid_decision,
+    hybrid_decision_from_images,
+    hybrid_decision_from_images_multi,
+    hybrid_decision_multi,
+)
 from .storage import fetch_signal, fetch_signals_by_date, init_db, insert_signal, update_outcome
 from .vision import (
     fuse_parsed_signals,
@@ -41,6 +46,12 @@ def decision(req: DecisionRequest) -> DecisionResult:
     return hybrid_decision(req)
 
 
+@app.post("/api/v1/decision/multi")
+def decision_multi(req: DecisionRequest) -> dict:
+    decisions = hybrid_decision_multi(req)
+    return {"strategies": {k: v.model_dump() for k, v in decisions.items()}}
+
+
 @app.post("/api/v1/signal-from-image")
 async def signal_from_image(
     symbol: str,
@@ -69,6 +80,20 @@ async def signal_from_image(
     }
     signal_id = insert_signal(record)
     return {"signal_id": signal_id, "parsed": parsed, "decision": result}
+
+
+@app.post("/api/v1/signal-from-image/multi")
+async def signal_from_image_multi(
+    symbol: str,
+    timeframe: str,
+    position: Annotated[str, Query(pattern="^(flat|long|short)$")] = "flat",
+    image: UploadFile = File(...),
+) -> dict:
+    data = await image.read()
+    parsed = parse_image_with_parallel_vision_models(data, symbol=symbol, timeframe=timeframe)
+    req = DecisionRequest(parsed=parsed, position=position)
+    decisions = hybrid_decision_from_images_multi(req, image_payloads=[(data, timeframe)])
+    return {"parsed": parsed, "strategies": {k: v.model_dump() for k, v in decisions.items()}}
 
 
 @app.post("/api/v1/signal-from-images")
