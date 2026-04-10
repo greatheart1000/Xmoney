@@ -252,6 +252,17 @@ multipart 上传 `image`，返回：
 
 系统会下载该图片进行解析与决策，并将 `image_url` 落库到 `signals.image_uri`，便于后续回测和审计追踪。
 
+### 4.3.3 统一入口（支持上传文件 + OSS URL）
+
+统一接口：
+
+`POST /api/v1/signal?symbol=SA605&timeframe=15m&position=flat`
+
+- 方式A：multipart 上传 `image`
+- 方式B：传 query 参数 `image_url=https://...`（OSS URL）
+
+二者任选其一；若同时不传会返回 400。
+
 ### 4.4 回填实际结果
 
 `PATCH /api/v1/signals/{signal_id}/outcome`

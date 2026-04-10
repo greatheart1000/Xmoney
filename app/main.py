@@ -120,6 +120,48 @@ def signal_from_oss_image(req: OssImageSignalRequest) -> dict:
     return {"signal_id": signal_id, "image_url": req.image_url, "parsed": parsed, "decision": result}
 
 
+@app.post("/api/v1/signal")
+async def signal_flexible(
+    symbol: str,
+    timeframe: str,
+    position: Annotated[str, Query(pattern="^(flat|long|short)$")] = "flat",
+    image_url: str | None = None,
+    image: UploadFile | None = File(default=None),
+) -> dict:
+    if image_url:
+        try:
+            image_bytes = _download_image_from_url(image_url)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"download image failed: {exc}") from exc
+        source_uri = image_url
+    elif image is not None:
+        image_bytes = await image.read()
+        source_uri = None
+    else:
+        raise HTTPException(status_code=400, detail="image or image_url is required")
+
+    parsed = parse_image_with_parallel_vision_models(image_bytes, symbol=symbol, timeframe=timeframe)
+    req = DecisionRequest(parsed=parsed, position=position)
+    result = hybrid_decision_from_images(req, image_payloads=[(image_bytes, timeframe)])
+    record = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "symbol": parsed.symbol,
+        "timeframe": parsed.timeframe,
+        "position": position,
+        "trend": result.trend.value,
+        "action": result.action.value,
+        "confidence": result.confidence,
+        "payload": {
+            "parsed": parsed.model_dump(),
+            "decision": result.model_dump(),
+        },
+        "image_uri": source_uri,
+        "outcome_return": None,
+    }
+    signal_id = insert_signal(record)
+    return {"signal_id": signal_id, "image_url": source_uri, "parsed": parsed, "decision": result}
+
+
 @app.post("/api/v1/signal-from-image/multi")
 async def signal_from_image_multi(
     symbol: str,

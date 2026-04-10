@@ -155,3 +155,87 @@ def test_signal_from_oss_image_endpoint(monkeypatch):
     body = resp.json()
     assert body["signal_id"] == 123
     assert body["image_url"] == "https://oss.example.com/a.png"
+
+
+def test_signal_flexible_with_image_url(monkeypatch):
+    monkeypatch.setattr("app.main._download_image_from_url", lambda url: b"fake-image")
+    monkeypatch.setattr(
+        "app.main.parse_image_with_parallel_vision_models",
+        lambda data, symbol, timeframe: ParsedImageSignal(
+            symbol=symbol,
+            timeframe=timeframe,
+            close=100,
+            ma5=101,
+            ma10=100.5,
+            ma20=100,
+            ma40=99,
+            ma60=98,
+            macd_diff=0.5,
+            macd_dea=0.3,
+            macd_hist=0.2,
+            volume=1000,
+            open_interest=10000,
+            confidence=0.8,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.main.hybrid_decision_from_images",
+        lambda req, image_payloads: DecisionResult(
+            trend="bullish",
+            action="long",
+            reason=["flex oss test"],
+            entry_zone=[100, 101],
+            stop_loss=99,
+            take_profit=[104],
+            confidence=0.8,
+            ai_decision_report="【AI 交易助手决策报告】",
+        ),
+    )
+    monkeypatch.setattr("app.main.insert_signal", lambda record: 456)
+    resp = client.post(
+        "/api/v1/signal?symbol=SA605&timeframe=15m&position=flat&image_url=https://oss.example.com/flex.png"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["signal_id"] == 456
+
+
+def test_signal_flexible_with_uploaded_file(monkeypatch):
+    monkeypatch.setattr(
+        "app.main.parse_image_with_parallel_vision_models",
+        lambda data, symbol, timeframe: ParsedImageSignal(
+            symbol=symbol,
+            timeframe=timeframe,
+            close=100,
+            ma5=101,
+            ma10=100.5,
+            ma20=100,
+            ma40=99,
+            ma60=98,
+            macd_diff=0.5,
+            macd_dea=0.3,
+            macd_hist=0.2,
+            volume=1000,
+            open_interest=10000,
+            confidence=0.8,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.main.hybrid_decision_from_images",
+        lambda req, image_payloads: DecisionResult(
+            trend="bullish",
+            action="long",
+            reason=["flex upload test"],
+            entry_zone=[100, 101],
+            stop_loss=99,
+            take_profit=[104],
+            confidence=0.8,
+            ai_decision_report="【AI 交易助手决策报告】",
+        ),
+    )
+    monkeypatch.setattr("app.main.insert_signal", lambda record: 789)
+    resp = client.post(
+        "/api/v1/signal?symbol=SA605&timeframe=15m&position=flat",
+        files={"image": ("chart.png", b"fake-image-bytes", "image/png")},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["signal_id"] == 789
