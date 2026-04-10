@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict
+from collections import defaultdict
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from .models import ParsedImageSignal
 
@@ -102,3 +103,71 @@ def parse_image_with_gemini(image_bytes: bytes, symbol: str, timeframe: str) -> 
     data["symbol"] = symbol
     data["timeframe"] = timeframe
     return ParsedImageSignal(**data)
+
+
+def parse_images_with_gemini(image_payloads: Sequence[Tuple[bytes, str]], symbol: str) -> List[ParsedImageSignal]:
+    return [
+        parse_image_with_gemini(image_bytes=image_bytes, symbol=symbol, timeframe=timeframe)
+        for image_bytes, timeframe in image_payloads
+    ]
+
+
+def _normalize_timeframe(timeframe: str) -> str:
+    return timeframe.strip().lower()
+
+
+def fuse_parsed_signals(signals: Iterable[ParsedImageSignal]) -> ParsedImageSignal:
+    items = list(signals)
+    if not items:
+        raise ValueError("signals must not be empty")
+
+    weights = {"5m": 1.0, "15m": 1.8, "30m": 2.6, "60m": 3.4}
+    normalized_frames = [_normalize_timeframe(s.timeframe) for s in items]
+    total_w = sum(weights.get(tf, 1.0) for tf in normalized_frames)
+
+    def wavg(attr: str) -> float:
+        return sum(getattr(s, attr) * weights.get(tf, 1.0) for s, tf in zip(items, normalized_frames)) / total_w
+
+    def flatten_unique(values: Iterable[List[float]]) -> List[float]:
+        flattened = {float(v) for lst in values for v in lst}
+        return sorted(flattened)
+
+    cumulative_weights: Dict[str, float] = defaultdict(float)
+    for tf in normalized_frames:
+        cumulative_weights[tf] += weights.get(tf, 1.0)
+    dominant = max(cumulative_weights, key=lambda tf: (cumulative_weights[tf], weights.get(tf, 1.0)))
+
+    return ParsedImageSignal(
+        symbol=items[0].symbol,
+        timeframe=dominant,
+        close=wavg("close"),
+        ma5=wavg("ma5"),
+        ma10=wavg("ma10"),
+        ma20=wavg("ma20"),
+        ma40=wavg("ma40"),
+        ma60=wavg("ma60"),
+        macd_diff=wavg("macd_diff"),
+        macd_dea=wavg("macd_dea"),
+        macd_hist=wavg("macd_hist"),
+        volume=wavg("volume"),
+        open_interest=wavg("open_interest"),
+        support_levels=flatten_unique(s.support_levels for s in items),
+        resistance_levels=flatten_unique(s.resistance_levels for s in items),
+        historical_support_levels=flatten_unique(s.historical_support_levels for s in items),
+        historical_resistance_levels=flatten_unique(s.historical_resistance_levels for s in items),
+        swing_high=max((s.swing_high for s in items if s.swing_high is not None), default=None),
+        swing_low=min((s.swing_low for s in items if s.swing_low is not None), default=None),
+        leg_start_price=wavg("leg_start_price") if all(s.leg_start_price is not None for s in items) else None,
+        leg_elapsed_bars=round(wavg("leg_elapsed_bars")) if all(s.leg_elapsed_bars is not None for s in items) else None,
+        avg_up_leg_bars=round(wavg("avg_up_leg_bars")) if all(s.avg_up_leg_bars is not None for s in items) else None,
+        avg_down_leg_bars=round(wavg("avg_down_leg_bars")) if all(s.avg_down_leg_bars is not None for s in items) else None,
+        avg_up_leg_move_pct=wavg("avg_up_leg_move_pct") if all(s.avg_up_leg_move_pct is not None for s in items) else None,
+        avg_down_leg_move_pct=wavg("avg_down_leg_move_pct") if all(s.avg_down_leg_move_pct is not None for s in items) else None,
+        chart_patterns=sorted({pattern for s in items for pattern in s.chart_patterns}),
+        confidence=min(1.0, sum(s.confidence for s in items) / len(items)),
+        raw_features={
+            "source": "multi_image_fusion",
+            "frames": ",".join(normalized_frames),
+            "count": str(len(items)),
+        },
+    )

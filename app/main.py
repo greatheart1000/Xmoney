@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+from typing import Annotated
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
 from .models import DecisionRequest, DecisionResult, OutcomeUpdate
 from .reporting import to_response
 from .llm_decision import hybrid_decision
 from .storage import fetch_signal, fetch_signals_by_date, init_db, insert_signal, update_outcome
-from .vision import parse_image_with_gemini
+from .vision import fuse_parsed_signals, parse_image_with_gemini, parse_images_with_gemini
 
 app = FastAPI(title="AI Futures Decision System", version="1.0.0")
 
@@ -40,7 +41,7 @@ def decision(req: DecisionRequest) -> DecisionResult:
 async def signal_from_image(
     symbol: str,
     timeframe: str,
-    position: str = "flat",
+    position: Annotated[str, Query(pattern="^(flat|long|short)$")] = "flat",
     image: UploadFile = File(...),
 ) -> dict:
     data = await image.read()
@@ -64,6 +65,52 @@ async def signal_from_image(
     }
     signal_id = insert_signal(record)
     return {"signal_id": signal_id, "parsed": parsed, "decision": result}
+
+
+@app.post("/api/v1/signal-from-images")
+async def signal_from_images(
+    symbol: str,
+    timeframes: str,
+    position: Annotated[str, Query(pattern="^(flat|long|short)$")] = "flat",
+    images: list[UploadFile] = File(...),
+) -> dict:
+    frames = [f.strip() for f in timeframes.split(",") if f.strip()]
+    if not frames:
+        raise HTTPException(status_code=400, detail="timeframes is required, e.g. 5m,15m,30m")
+    if len(frames) != len(images):
+        raise HTTPException(status_code=400, detail="timeframes count must match images count")
+
+    payloads = []
+    for frame, image in zip(frames, images):
+        payloads.append((await image.read(), frame))
+
+    parsed_list = parse_images_with_gemini(payloads, symbol=symbol)
+    fused_parsed = fuse_parsed_signals(parsed_list)
+    req = DecisionRequest(parsed=fused_parsed, position=position)
+    result = hybrid_decision(req)
+
+    record = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "symbol": symbol,
+        "timeframe": f"fusion({','.join(frames)})",
+        "position": position,
+        "trend": result.trend.value,
+        "action": result.action.value,
+        "confidence": result.confidence,
+        "payload": {
+            "parsed_list": [p.model_dump() for p in parsed_list],
+            "fused_parsed": fused_parsed.model_dump(),
+            "decision": result.model_dump(),
+        },
+        "outcome_return": None,
+    }
+    signal_id = insert_signal(record)
+    return {
+        "signal_id": signal_id,
+        "parsed_list": parsed_list,
+        "fused_parsed": fused_parsed,
+        "decision": result,
+    }
 
 
 @app.patch("/api/v1/signals/{signal_id}/outcome")
