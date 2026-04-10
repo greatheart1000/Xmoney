@@ -345,16 +345,18 @@ def _ensemble_decision(model_outputs: List[Tuple[str, DecisionResult]]) -> Decis
 
     actions = {d.action for _, d in model_outputs}
     if len(actions) > 1:
-        return DecisionResult(
+        return _with_decision_report(
+            DecisionResult(
             trend=chosen.trend,
             action=SignalAction.wait,
             reason=["多模型交叉验证存在分歧，先观望等待二次确认"] + merged_reason,
             expected_remaining_bars=chosen.expected_remaining_bars,
             expected_total_move_pct=chosen.expected_total_move_pct,
             confidence=max(0.35, avg_conf - 0.15),
+            )
         )
 
-    return DecisionResult(**{**chosen.model_dump(), "reason": merged_reason, "confidence": avg_conf})
+    return _with_decision_report(DecisionResult(**{**chosen.model_dump(), "reason": merged_reason, "confidence": avg_conf}))
 
 
 def hybrid_decision(
@@ -374,7 +376,8 @@ def hybrid_decision(
     # 双模型主分析（80%）+规则风控（20%）
     risky_open = llm_result.action in {SignalAction.long, SignalAction.short}
     if rule_result.action == SignalAction.wait and risky_open:
-        return DecisionResult(
+        return _with_decision_report(
+            DecisionResult(
             trend=Trend.neutral,
             action=SignalAction.wait,
             reason=[f"策略[{strategy_name}] 规则风控拦截：双模型开仓信号未通过20%风控层"]
@@ -386,13 +389,14 @@ def hybrid_decision(
             expected_remaining_bars=llm_result.expected_remaining_bars,
             expected_total_move_pct=llm_result.expected_total_move_pct,
             confidence=min(llm_result.confidence, rule_result.confidence),
+            )
         )
 
     merged_reason = [f"策略[{strategy_name}] 决策权重：双模型(80%) + 规则风控(20%)"] + llm_result.reason
     if rule_result.action != llm_result.action:
         merged_reason.append(f"规则引擎建议: {rule_result.action.value}")
 
-    return DecisionResult(**{**llm_result.model_dump(), "reason": merged_reason})
+    return _with_decision_report(DecisionResult(**{**llm_result.model_dump(), "reason": merged_reason}))
 
 
 def hybrid_decision_from_images(
@@ -415,7 +419,8 @@ def hybrid_decision_from_images(
     llm_result = _ensemble_decision(model_outputs)
     risky_open = llm_result.action in {SignalAction.long, SignalAction.short}
     if rule_result.action == SignalAction.wait and risky_open:
-        return DecisionResult(
+        return _with_decision_report(
+            DecisionResult(
             trend=Trend.neutral,
             action=SignalAction.wait,
             reason=[f"策略[{strategy_name}] 规则风控拦截：视觉双模型开仓信号未通过20%风控层"]
@@ -427,6 +432,7 @@ def hybrid_decision_from_images(
             expected_remaining_bars=llm_result.expected_remaining_bars,
             expected_total_move_pct=llm_result.expected_total_move_pct,
             confidence=min(llm_result.confidence, rule_result.confidence),
+            )
         )
 
     merged_reason = [f"策略[{strategy_name}] 决策来源：视觉双模型按固定量化规则判断(80%) + 规则风控(20%)"] + llm_result.reason

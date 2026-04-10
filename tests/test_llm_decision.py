@@ -83,6 +83,8 @@ def test_hybrid_uses_dual_model_consensus(monkeypatch):
 
     assert result.action.value == "short"
     assert "双模型" in result.reason[0]
+    assert result.ai_decision_report is not None
+    assert "【AI 交易助手" in result.ai_decision_report
 
 
 def test_hybrid_waits_when_dual_models_disagree(monkeypatch):

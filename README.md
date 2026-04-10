@@ -233,6 +233,25 @@ multipart 上传 `image`，返回：
 - `equity_YYYY-MM-DD.png`
 - `daily_YYYY-MM-DD.html`
 
+### 4.6 回测校核统计（过去一天/一周/一月）
+
+当你持续回填 `outcome_return` 后，可直接统计策略正确率：
+
+`GET /api/v1/backtest/summary?period=1d`
+
+支持：
+- `period=1d`（过去一天）
+- `period=7d`（过去一周）
+- `period=30d`（过去一月）
+
+返回包括：
+- `accuracy`：总体正确率
+- `long_short_accuracy`：方向性信号正确率
+- `wait_accuracy`：观望信号正确率（默认按小波动阈值）
+- `high_quality_accuracy`：高盈亏比 setup 的命中率
+
+> 你的图片在 OSS 存储没有问题：只要每日用图片生成信号并回填真实结果，统计接口就能做历史回顾。若后续需要，我可以继续补一个“从 OSS 批量回放并自动回填”的任务接口。
+
 ## 5. 测试
 
 ```bash

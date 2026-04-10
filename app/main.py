@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 from datetime import datetime, timezone
+import urllib.request
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
@@ -32,6 +33,12 @@ def startup() -> None:
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+def _download_image_from_url(url: str) -> bytes:
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        return resp.read()
 
 
 @app.post("/api/v1/parse-image")
@@ -76,6 +83,7 @@ async def signal_from_image(
             "parsed": parsed.model_dump(),
             "decision": result.model_dump(),
         },
+        "image_uri": None,
         "outcome_return": None,
     }
     signal_id = insert_signal(record)
@@ -163,3 +171,11 @@ def daily_report_html(date: str):
     rows = fetch_signals_by_date(date)
     report = to_response(date, rows)
     return FileResponse(report.html_path)
+
+
+@app.get("/api/v1/backtest/summary")
+def backtest_summary_api(period: str = "1d") -> dict:
+    start_dt, end_dt = resolve_period_window(period=period)
+    rows = fetch_signals_between(start_dt.isoformat(), end_dt.isoformat())
+    summary = backtest_summary(rows, period_start=start_dt, period_end=end_dt)
+    return summary.model_dump()
