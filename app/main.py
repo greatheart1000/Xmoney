@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from typing import Annotated
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
 from .models import DecisionRequest, DecisionResult, OutcomeUpdate
@@ -40,7 +41,7 @@ def decision(req: DecisionRequest) -> DecisionResult:
 async def signal_from_image(
     symbol: str,
     timeframe: str,
-    position: str = "flat",
+    position: Annotated[str, Query(pattern="^(flat|long|short)$")] = "flat",
     image: UploadFile = File(...),
 ) -> dict:
     data = await image.read()
