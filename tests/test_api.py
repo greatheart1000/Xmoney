@@ -1,6 +1,7 @@
+import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import _validate_external_image_url, app
 from app.models import DecisionResult
 
 
@@ -73,3 +74,23 @@ def test_decision_multi_endpoint(monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert set(body["strategies"].keys()) == {"short_term", "swing", "long_term"}
+
+
+def test_validate_external_image_url_rejects_non_https(monkeypatch):
+    monkeypatch.setattr("app.main._is_private_or_local_host", lambda host: False)
+    with pytest.raises(Exception) as exc_info:
+        _validate_external_image_url("http://example.com/chart.png")
+    assert getattr(exc_info.value, "status_code", None) == 400
+
+
+def test_validate_external_image_url_rejects_private_host(monkeypatch):
+    monkeypatch.setattr("app.main._is_private_or_local_host", lambda host: True)
+    with pytest.raises(Exception) as exc_info:
+        _validate_external_image_url("https://example.com/chart.png")
+    assert getattr(exc_info.value, "status_code", None) == 400
+
+
+def test_validate_external_image_url_allows_public_https(monkeypatch):
+    monkeypatch.setattr("app.main._is_private_or_local_host", lambda host: False)
+    url = _validate_external_image_url("https://example.com/chart.png")
+    assert url == "https://example.com/chart.png"

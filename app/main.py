@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from typing import Annotated
 from datetime import datetime, timezone
+import ipaddress
+import os
+import socket
+from urllib.parse import urljoin, urlparse
 import urllib.request
+from urllib.error import HTTPError
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
-from .models import DecisionRequest, DecisionResult, OutcomeUpdate
+from .models import DecisionRequest, DecisionResult, OssImageSignalRequest, OutcomeUpdate
 from .reporting import to_response
 from .llm_decision import (
     hybrid_decision,
@@ -35,10 +40,72 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+_ALLOWED_IMAGE_HOSTS = {
+    h.strip().lower() for h in os.getenv("OSS_IMAGE_ALLOWED_HOSTS", "").split(",") if h.strip()
+}
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _is_private_or_local_host(hostname: str) -> bool:
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return True
+
+    for family, _, _, _, sockaddr in infos:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        ip = ipaddress.ip_address(sockaddr[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            return True
+    return False
+
+
+def _validate_external_image_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise HTTPException(status_code=400, detail="image_url must use https")
+    if not parsed.hostname:
+        raise HTTPException(status_code=400, detail="image_url host is required")
+
+    host = parsed.hostname.lower()
+    if _ALLOWED_IMAGE_HOSTS and host not in _ALLOWED_IMAGE_HOSTS:
+        raise HTTPException(status_code=400, detail="image_url host is not allowlisted")
+
+    if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".local"):
+        raise HTTPException(status_code=400, detail="image_url host is not allowed")
+
+    if _is_private_or_local_host(host):
+        raise HTTPException(status_code=400, detail="image_url resolves to a private/local address")
+
+    return url
+
+
 def _download_image_from_url(url: str) -> bytes:
-    req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        return resp.read()
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    next_url = _validate_external_image_url(url)
+
+    for _ in range(5):
+        req = urllib.request.Request(next_url, method="GET")
+        try:
+            with opener.open(req, timeout=25) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                if not content_type.startswith("image/"):
+                    raise HTTPException(status_code=400, detail="image_url must return image content")
+                return resp.read()
+        except HTTPError as exc:
+            if exc.code not in {301, 302, 303, 307, 308}:
+                raise
+            location = exc.headers.get("Location")
+            if not location:
+                raise HTTPException(status_code=400, detail="redirect response missing Location header")
+            next_url = _validate_external_image_url(urljoin(next_url, location))
+
+    raise HTTPException(status_code=400, detail="too many redirects for image_url")
 
 
 @app.post("/api/v1/parse-image")
@@ -57,6 +124,34 @@ def decision(req: DecisionRequest) -> DecisionResult:
 def decision_multi(req: DecisionRequest) -> dict:
     decisions = hybrid_decision_multi(req)
     return {"strategies": {k: v.model_dump() for k, v in decisions.items()}}
+
+
+
+
+@app.post("/api/v1/signal-from-oss-image")
+async def signal_from_oss_image(req: OssImageSignalRequest) -> dict:
+    image_data = _download_image_from_url(req.image_url)
+    parsed = parse_image_with_parallel_vision_models(image_data, symbol=req.symbol, timeframe=req.timeframe)
+    decision_req = DecisionRequest(parsed=parsed, position=req.position)
+    result = hybrid_decision_from_images(decision_req, image_payloads=[(image_data, req.timeframe)])
+
+    record = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "symbol": parsed.symbol,
+        "timeframe": parsed.timeframe,
+        "position": req.position,
+        "trend": result.trend.value,
+        "action": result.action.value,
+        "confidence": result.confidence,
+        "payload": {
+            "parsed": parsed.model_dump(),
+            "decision": result.model_dump(),
+        },
+        "image_uri": req.image_url,
+        "outcome_return": None,
+    }
+    signal_id = insert_signal(record)
+    return {"signal_id": signal_id, "parsed": parsed, "decision": result}
 
 
 @app.post("/api/v1/signal-from-image")
