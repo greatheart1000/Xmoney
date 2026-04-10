@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from .models import ParsedImageSignal
@@ -112,30 +111,22 @@ def parse_images_with_gemini(image_payloads: Sequence[Tuple[bytes, str]], symbol
     ]
 
 
-def _normalize_timeframe(timeframe: str) -> str:
-    return timeframe.strip().lower()
-
-
 def fuse_parsed_signals(signals: Iterable[ParsedImageSignal]) -> ParsedImageSignal:
     items = list(signals)
     if not items:
         raise ValueError("signals must not be empty")
 
     weights = {"5m": 1.0, "15m": 1.8, "30m": 2.6, "60m": 3.4}
-    normalized_frames = [_normalize_timeframe(s.timeframe) for s in items]
-    total_w = sum(weights.get(tf, 1.0) for tf in normalized_frames)
+    total_w = sum(weights.get(s.timeframe, 1.0) for s in items)
 
     def wavg(attr: str) -> float:
-        return sum(getattr(s, attr) * weights.get(tf, 1.0) for s, tf in zip(items, normalized_frames)) / total_w
+        return sum(getattr(s, attr) * weights.get(s.timeframe, 1.0) for s in items) / total_w
 
     def flatten_unique(values: Iterable[List[float]]) -> List[float]:
         flattened = {float(v) for lst in values for v in lst}
         return sorted(flattened)
 
-    cumulative_weights: Dict[str, float] = defaultdict(float)
-    for tf in normalized_frames:
-        cumulative_weights[tf] += weights.get(tf, 1.0)
-    dominant = max(cumulative_weights, key=lambda tf: (cumulative_weights[tf], weights.get(tf, 1.0)))
+    dominant = max(items, key=lambda x: weights.get(x.timeframe, 1.0)).timeframe
 
     return ParsedImageSignal(
         symbol=items[0].symbol,
@@ -167,7 +158,7 @@ def fuse_parsed_signals(signals: Iterable[ParsedImageSignal]) -> ParsedImageSign
         confidence=min(1.0, sum(s.confidence for s in items) / len(items)),
         raw_features={
             "source": "multi_image_fusion",
-            "frames": ",".join(normalized_frames),
+            "frames": ",".join(s.timeframe for s in items),
             "count": str(len(items)),
         },
     )

@@ -71,7 +71,7 @@ async def signal_from_image(
 async def signal_from_images(
     symbol: str,
     timeframes: str,
-    position: Annotated[str, Query(pattern="^(flat|long|short)$")] = "flat",
+    position: str = "flat",
     images: list[UploadFile] = File(...),
 ) -> dict:
     frames = [f.strip() for f in timeframes.split(",") if f.strip()]
