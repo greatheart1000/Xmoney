@@ -127,7 +127,6 @@ def test_hybrid_waits_when_dual_models_disagree(monkeypatch):
 
     assert result.action.value == "wait"
     assert any("交叉验证存在分歧" in r for r in result.reason)
-    assert result.ai_decision_report is not None
 
 
 def test_hybrid_multi_returns_three_strategy_results(monkeypatch):
@@ -183,47 +182,3 @@ def test_hybrid_multi_returns_three_strategy_results(monkeypatch):
 
     assert set(result.keys()) == {"short_term", "swing", "long_term"}
     assert all(any(f"策略[{name}]" in r for r in decision.reason) for name, decision in result.items())
-    assert all("【AI 交易助手决策报告】" in (v.ai_decision_report or "") for v in result.values())
-
-
-def test_hybrid_downgrades_open_when_rr_below_threshold(monkeypatch):
-    monkeypatch.setattr(
-        "app.llm_decision._collect_model_decisions",
-        lambda req, strategy_name="default", strategy_profile=None: [
-            (
-                "gemini",
-                DecisionResult(
-                    trend="bullish",
-                    action="long",
-                    reason=["gemini long"],
-                    entry_zone=[100, 100],
-                    stop_loss=98,
-                    take_profit=[103],  # RR = 1.5
-                    confidence=0.85,
-                ),
-            ),
-            (
-                "deepseek",
-                DecisionResult(
-                    trend="bullish",
-                    action="long",
-                    reason=["deepseek long"],
-                    entry_zone=[100, 100],
-                    stop_loss=98,
-                    take_profit=[103],  # RR = 1.5
-                    confidence=0.8,
-                ),
-            ),
-        ],
-    )
-    result = hybrid_decision(
-        DecisionRequest(
-            parsed=_sample_parsed(),
-            market_regime_30m=MarketRegime.bullish,
-            market_regime_15m=MarketRegime.bullish,
-        )
-    )
-    assert result.action.value == "wait"
-    assert result.risk_reward_ratio is not None and result.risk_reward_ratio < 3.0
-    assert result.is_high_quality_setup is False
-    assert any("盈亏比低于 3.0" in r for r in result.reason)

@@ -187,103 +187,6 @@ def _to_decision_result(data: Dict[str, Any]) -> DecisionResult:
     return DecisionResult(**normalized)
 
 
-def _fmt_range(values: Optional[List[float]]) -> str:
-    if not values:
-        return "N/A"
-    if len(values) == 1:
-        return f"{values[0]:.2f}"
-    return f"{values[0]:.2f} - {values[-1]:.2f}"
-
-
-def _compute_risk_reward_ratio(result: DecisionResult) -> Optional[float]:
-    if not result.entry_zone or result.stop_loss is None or not result.take_profit:
-        return None
-    entry = sum(result.entry_zone) / len(result.entry_zone)
-    if result.action == SignalAction.long:
-        reward = max(result.take_profit) - entry
-        risk = entry - result.stop_loss
-    elif result.action == SignalAction.short:
-        reward = entry - min(result.take_profit)
-        risk = result.stop_loss - entry
-    else:
-        return None
-    if risk <= 0 or reward <= 0:
-        return None
-    return reward / risk
-
-
-def _apply_risk_reward_filter(result: DecisionResult) -> DecisionResult:
-    rr = _compute_risk_reward_ratio(result)
-    if rr is None and result.risk_reward_ratio is not None:
-        rr = result.risk_reward_ratio
-    payload = result.model_dump()
-    payload["risk_reward_ratio"] = rr
-    payload["is_high_quality_setup"] = bool(rr is not None and rr >= 3.0) or result.is_high_quality_setup
-
-    if result.action in {SignalAction.long, SignalAction.short}:
-        if rr is None:
-            payload["action"] = SignalAction.wait
-            payload["reason"] = result.reason + ["当前无法计算有效盈亏比，建议等待更清晰的 entry/stop/take-profit。"]
-        elif rr < 3.0:
-            payload["action"] = SignalAction.wait
-            payload["reason"] = result.reason + ["当前价格已脱离安全区，盈亏比低于 3.0，建议等待回调。"]
-            payload["is_high_quality_setup"] = False
-    return DecisionResult(**payload)
-
-
-def _format_ai_decision_report(result: DecisionResult) -> str:
-    action_map = {
-        SignalAction.wait: "当前建议观望，等待更清晰信号。",
-        SignalAction.long: "符合进场做多条件。",
-        SignalAction.short: "符合进场做空条件。",
-        SignalAction.hold_long: "继续持有多单。",
-        SignalAction.hold_short: "继续持有空单。",
-        SignalAction.reduce_long: "建议多单减仓。",
-        SignalAction.reduce_short: "建议空单减仓。",
-    }
-    status = action_map.get(result.action, "建议等待确认。")
-    reasons = result.reason[:3] if result.reason else ["暂无明确依据，建议谨慎。"]
-    reason_lines = "\n".join([f"{idx + 1}. {txt}" for idx, txt in enumerate(reasons)])
-    stop_text = f"{result.stop_loss:.2f}" if result.stop_loss is not None else "N/A"
-
-    bars_text = (
-        f"约 {result.expected_remaining_bars} 根K线（根据时间窗估算）。"
-        if result.expected_remaining_bars is not None
-        else "N/A。"
-    )
-    pct_text = (
-        f"{result.expected_total_move_pct * 100:+.2f}%"
-        if result.expected_total_move_pct is not None
-        else "N/A"
-    )
-    rr_text = f"1 : {result.risk_reward_ratio:.2f}" if result.risk_reward_ratio is not None else "N/A"
-    header = "【AI 交易助手 - 高盈亏比挖掘】" if result.is_high_quality_setup else "【AI 交易助手决策报告】"
-
-    return (
-        f"{header}\n"
-        f"当前状态：{status}\n"
-        "决策依据：\n"
-        f"{reason_lines}\n"
-        "执行参数：\n"
-        f"- Entry（进场）：{_fmt_range(result.entry_zone)}\n"
-        f"- Stop（止损）：{stop_text}\n"
-        f"- Take-profit（止盈）：{_fmt_range(result.take_profit)}\n"
-        "时间/空间预判：\n"
-        f"- Expected Remaining Bars：{bars_text}\n"
-        f"- Expected Total Move Pct：{pct_text}\n"
-        f"- 风险回报比：{rr_text}\n"
-        "操作指引：\n"
-        "- 保护性止损：到达1:1后将止损上移至开仓价。\n"
-        "- 分批止盈：1:2先减仓，剩余仓位尝试MA20移动止盈。\n"
-        "- 时间止损：超过预期K线仍不达标则主动离场。"
-    )
-
-
-def _with_decision_report(result: DecisionResult) -> DecisionResult:
-    filtered = _apply_risk_reward_filter(result)
-    return DecisionResult(**{**filtered.model_dump(), "ai_decision_report": _format_ai_decision_report(filtered)})
-
-
 def _collect_model_decisions(
     req: DecisionRequest,
     strategy_name: str = "default",
@@ -466,7 +369,7 @@ def hybrid_decision(
     model_outputs = _collect_model_decisions(req, strategy_name=strategy_name, strategy_profile=strategy_profile)
     if not model_outputs:
         fallback_reason = [f"策略[{strategy_name}] LLM不可用（Gemini/DeepSeek均不可用），回退到规则引擎"] + rule_result.reason
-        return _with_decision_report(DecisionResult(**{**rule_result.model_dump(), "reason": fallback_reason}))
+        return DecisionResult(**{**rule_result.model_dump(), "reason": fallback_reason})
 
     llm_result = _ensemble_decision(model_outputs)
 
@@ -511,7 +414,7 @@ def hybrid_decision_from_images(
     )
     if not model_outputs:
         fallback_reason = [f"策略[{strategy_name}] 视觉LLM不可用（Gemini/DeepSeek均不可用），回退到规则引擎"] + rule_result.reason
-        return _with_decision_report(DecisionResult(**{**rule_result.model_dump(), "reason": fallback_reason}))
+        return DecisionResult(**{**rule_result.model_dump(), "reason": fallback_reason})
 
     llm_result = _ensemble_decision(model_outputs)
     risky_open = llm_result.action in {SignalAction.long, SignalAction.short}
@@ -535,7 +438,7 @@ def hybrid_decision_from_images(
     merged_reason = [f"策略[{strategy_name}] 决策来源：视觉双模型按固定量化规则判断(80%) + 规则风控(20%)"] + llm_result.reason
     if rule_result.action != llm_result.action:
         merged_reason.append(f"规则引擎建议: {rule_result.action.value}")
-    return _with_decision_report(DecisionResult(**{**llm_result.model_dump(), "reason": merged_reason}))
+    return DecisionResult(**{**llm_result.model_dump(), "reason": merged_reason})
 
 
 def hybrid_decision_multi(req: DecisionRequest) -> Dict[str, DecisionResult]:

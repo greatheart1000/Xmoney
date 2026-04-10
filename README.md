@@ -60,8 +60,6 @@ export DEEPSEEK_BASE_URL=https://api.deepseek.com/chat/completions
 - 每个策略可配置：`name`、`description`、`rules[]`
 
 系统会在同一份图像/结构化行情输入上，分别注入不同策略规则，生成三份独立决策结果。
-每份结果都包含 `ai_decision_report`（中文结构化报告），用于直接展示给交易员。
-系统会强制执行高盈亏比过滤：`risk_reward_ratio < 3.0` 的开仓信号会自动降级为 `wait`。
 
 ## 4. 关键接口
 
@@ -158,24 +156,7 @@ body 示例：
 
 同时会把 `historical_support_levels` 与 `historical_resistance_levels` 合并到当前支撑/压力分析中。
 
-### 4.2.4 高盈亏比过滤（Risk-Reward Gate）
-
-系统会对开仓动作执行硬性过滤：
-
-- 计算 `risk_reward_ratio`（多头：`(TP-Entry)/(Entry-Stop)`；空头对称）
-- 若开仓建议的 `risk_reward_ratio < 3.0`，则强制降级为 `wait`
-- `reason` 增加：`当前价格已脱离安全区，盈亏比低于 3.0，建议等待回调。`
-
-返回字段新增：
-
-```json
-{
-  "risk_reward_ratio": 4.2,
-  "is_high_quality_setup": true
-}
-```
-
-### 4.2.5 多策略决策（同一输入输出三套建议）
+### 4.2.4 多策略决策（同一输入输出三套建议）
 
 `POST /api/v1/decision/multi`
 
@@ -184,14 +165,14 @@ body 示例：
 ```json
 {
   "strategies": {
-    "short_term": { "action": "long", "entry_zone": [2560, 2570], "stop_loss": 2535, "take_profit": [2600], "ai_decision_report": "【AI 交易助手决策报告】..." },
+    "short_term": { "action": "long", "entry_zone": [2560, 2570], "stop_loss": 2535, "take_profit": [2600] },
     "swing": { "action": "wait", "reason": ["等待30m/15m二次确认"] },
     "long_term": { "action": "hold_long", "take_profit": [2655, 2700] }
   }
 }
 ```
 
-### 4.2.6 AI视觉交易助手执行范式（VQA）
+### 4.2.5 AI视觉交易助手执行范式（VQA）
 
 当你上传 15m/30m K 线图并调用决策接口时，系统按以下固定顺序执行（右侧趋势追踪）：
 
@@ -234,34 +215,6 @@ multipart 上传 `image`，返回：
 
 - `parsed`：图像解析后的指标结构
 - `strategies`：短线/波段/长线三套决策结果
-
-### 4.3.2 OSS 图片直连（不上传文件）
-
-如果你的K线图已经存放在 OSS，可以直接传 URL：
-
-`POST /api/v1/signal-from-oss-image`
-
-```json
-{
-  "symbol": "SA605",
-  "timeframe": "15m",
-  "image_url": "https://your-oss-domain/path/to/chart.png",
-  "position": "flat"
-}
-```
-
-系统会下载该图片进行解析与决策，并将 `image_url` 落库到 `signals.image_uri`，便于后续回测和审计追踪。
-
-### 4.3.3 统一入口（支持上传文件 + OSS URL）
-
-统一接口：
-
-`POST /api/v1/signal?symbol=SA605&timeframe=15m&position=flat`
-
-- 方式A：multipart 上传 `image`
-- 方式B：传 query 参数 `image_url=https://...`（OSS URL）
-
-二者任选其一；若同时不传会返回 400。
 
 ### 4.4 回填实际结果
 
