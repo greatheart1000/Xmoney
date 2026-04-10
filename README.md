@@ -51,6 +51,18 @@ export DEEPSEEK_BASE_URL=https://api.deepseek.com/chat/completions
 
 你可以把自己的交易规则持续写入 `config/user_rules.md`，LLM每次决策都会自动注入。
 
+### 3.2 多策略配置（短线/波段/长线）
+
+你可以通过文件配置“同一张图，输出多套策略建议”：
+
+- 配置文件：`config/strategy_profiles.json`
+- 默认内置三种策略：`short_term` / `swing` / `long_term`
+- 每个策略可配置：`name`、`description`、`rules[]`
+
+系统会在同一份图像/结构化行情输入上，分别注入不同策略规则，生成三份独立决策结果。
+每份结果都包含 `ai_decision_report`（中文结构化报告），用于直接展示给交易员。
+系统会强制执行高盈亏比过滤：`risk_reward_ratio < 3.0` 的开仓信号会自动降级为 `wait`。
+
 ## 4. 关键接口
 
 ### 4.1 图片解析
@@ -146,11 +158,99 @@ body 示例：
 
 同时会把 `historical_support_levels` 与 `historical_resistance_levels` 合并到当前支撑/压力分析中。
 
+### 4.2.4 高盈亏比过滤（Risk-Reward Gate）
+
+系统会对开仓动作执行硬性过滤：
+
+- 计算 `risk_reward_ratio`（多头：`(TP-Entry)/(Entry-Stop)`；空头对称）
+- 若开仓建议的 `risk_reward_ratio < 3.0`，则强制降级为 `wait`
+- `reason` 增加：`当前价格已脱离安全区，盈亏比低于 3.0，建议等待回调。`
+
+返回字段新增：
+
+```json
+{
+  "risk_reward_ratio": 4.2,
+  "is_high_quality_setup": true
+}
+```
+
+### 4.2.5 多策略决策（同一输入输出三套建议）
+
+`POST /api/v1/decision/multi`
+
+输入同 `/api/v1/decision`，输出示例：
+
+```json
+{
+  "strategies": {
+    "short_term": { "action": "long", "entry_zone": [2560, 2570], "stop_loss": 2535, "take_profit": [2600], "ai_decision_report": "【AI 交易助手决策报告】..." },
+    "swing": { "action": "wait", "reason": ["等待30m/15m二次确认"] },
+    "long_term": { "action": "hold_long", "take_profit": [2655, 2700] }
+  }
+}
+```
+
+### 4.2.6 AI视觉交易助手执行范式（VQA）
+
+当你上传 15m/30m K 线图并调用决策接口时，系统按以下固定顺序执行（右侧趋势追踪）：
+
+1. 文华指数 30m 定方向；
+2. 文华指数 15m 确认不冲突；
+3. 再看单品种 MA(5/10/20/40/60) + MACD + 成交量 + 持仓量；
+4. 合并历史支撑/压力与 Fib 回调位（0.236/0.382/0.5/0.618/0.786）；
+5. 用 Fib 时间窗（0.618/1.0/1.618）估算 `expected_remaining_bars`；
+6. 输出结构化交易动作与风控参数。
+
+推荐将输出用于“执行参考”而非“盲目下单”，并补充一条实盘风控规则：
+
+- 当浮盈达到 1:1 盈亏比后，将止损上移到保本位（break-even）。
+
+建议输出模板：
+
+```json
+{
+  "action": "wait|long|short|hold_long|hold_short|reduce_long|reduce_short",
+  "entry_zone": [2560, 2570],
+  "stop_loss": 2535,
+  "take_profit": [2620, 2655],
+  "expected_remaining_bars": 12,
+  "expected_total_move_pct": 0.035,
+  "reason": ["文华30m与15m同向", "MA/MACD/量仓共振"]
+}
+```
+
 ### 4.3 一步生成信号（解析+决策+落库）
 
 `POST /api/v1/signal-from-image?symbol=SA605&timeframe=5m&position=flat`
 
 multipart 上传 `image`。
+
+### 4.3.1 单图多策略建议
+
+`POST /api/v1/signal-from-image/multi?symbol=SA605&timeframe=15m&position=flat`
+
+multipart 上传 `image`，返回：
+
+- `parsed`：图像解析后的指标结构
+- `strategies`：短线/波段/长线三套决策结果
+
+### 4.3.2 OSS 图片直连（不上传文件）
+
+如果你的K线图已经存放在 OSS，可以直接传 URL：
+
+`POST /api/v1/signal-from-oss-image`
+
+```json
+{
+  "symbol": "SA605",
+  "timeframe": "15m",
+  "image_url": "https://your-oss-domain/path/to/chart.png",
+  "position": "flat"
+}
+```
+
+系统会下载该图片进行解析与决策，并将 `image_url` 落库到 `signals.image_uri`，便于后续回测和审计追踪。
 
 ### 4.4 回填实际结果
 
@@ -168,6 +268,25 @@ multipart 上传 `image`。
 报告输出到 `reports/`，包含：
 - `equity_YYYY-MM-DD.png`
 - `daily_YYYY-MM-DD.html`
+
+### 4.6 回测校核统计（过去一天/一周/一月）
+
+当你持续回填 `outcome_return` 后，可直接统计策略正确率：
+
+`GET /api/v1/backtest/summary?period=1d`
+
+支持：
+- `period=1d`（过去一天）
+- `period=7d`（过去一周）
+- `period=30d`（过去一月）
+
+返回包括：
+- `accuracy`：总体正确率
+- `long_short_accuracy`：方向性信号正确率
+- `wait_accuracy`：观望信号正确率（默认按小波动阈值）
+- `high_quality_accuracy`：高盈亏比 setup 的命中率
+
+> 你的图片在 OSS 存储没有问题：只要每日用图片生成信号并回填真实结果，统计接口就能做历史回顾。若后续需要，我可以继续补一个“从 OSS 批量回放并自动回填”的任务接口。
 
 ## 5. 测试
 

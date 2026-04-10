@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 
-from .models import DailyReportResponse, DailyStats
+from .models import BacktestSummary, DailyReportResponse, DailyStats
 
 
 def _calc_stats(date_str: str, rows: List[Dict]) -> DailyStats:
@@ -135,3 +135,56 @@ def build_daily_report(date_str: str, rows: List[Dict]) -> Tuple[DailyStats, Pat
 def to_response(date_str: str, rows: List[Dict]) -> DailyReportResponse:
     stats, chart_path, html_path = build_daily_report(date_str, rows)
     return DailyReportResponse(stats=stats, chart_path=str(chart_path), html_path=str(html_path))
+
+
+def resolve_period_window(period: str, end: datetime | None = None) -> tuple[datetime, datetime]:
+    end_dt = end or datetime.now(timezone.utc)
+    period_map = {"1d": 1, "7d": 7, "30d": 30}
+    days = period_map.get(period, 1)
+    start_dt = end_dt - timedelta(days=days)
+    return start_dt, end_dt
+
+
+def _is_prediction_correct(action: str, outcome_return: float, flat_threshold: float = 0.002) -> bool:
+    long_actions = {"long", "hold_long", "reduce_short"}
+    short_actions = {"short", "hold_short", "reduce_long"}
+    wait_actions = {"wait"}
+    if action in long_actions:
+        return outcome_return > 0
+    if action in short_actions:
+        return outcome_return < 0
+    if action in wait_actions:
+        return abs(outcome_return) <= flat_threshold
+    return False
+
+
+def backtest_summary(rows: List[Dict], period_start: datetime, period_end: datetime) -> BacktestSummary:
+    evaluated = [r for r in rows if r.get("outcome_return") is not None]
+    correct = [r for r in evaluated if _is_prediction_correct(r.get("action", ""), float(r["outcome_return"]))]
+
+    directional = [r for r in evaluated if r.get("action") in {"long", "short", "hold_long", "hold_short"}]
+    directional_correct = [r for r in directional if _is_prediction_correct(r.get("action", ""), float(r["outcome_return"]))]
+    waits = [r for r in evaluated if r.get("action") == "wait"]
+    wait_correct = [r for r in waits if _is_prediction_correct("wait", float(r["outcome_return"]))]
+
+    high_quality = [
+        r
+        for r in evaluated
+        if bool((r.get("payload", {}).get("decision", {}) or {}).get("is_high_quality_setup"))
+    ]
+    high_quality_correct = [r for r in high_quality if _is_prediction_correct(r.get("action", ""), float(r["outcome_return"]))]
+
+    return BacktestSummary(
+        period_start=period_start.isoformat(),
+        period_end=period_end.isoformat(),
+        total_signals=len(rows),
+        evaluated_signals=len(evaluated),
+        correct_signals=len(correct),
+        accuracy=(len(correct) / len(evaluated)) if evaluated else 0.0,
+        long_short_signals=len(directional),
+        long_short_accuracy=(len(directional_correct) / len(directional)) if directional else 0.0,
+        wait_signals=len(waits),
+        wait_accuracy=(len(wait_correct) / len(waits)) if waits else 0.0,
+        high_quality_signals=len(high_quality),
+        high_quality_accuracy=(len(high_quality_correct) / len(high_quality)) if high_quality else 0.0,
+    )

@@ -5,13 +5,41 @@ import os
 import urllib.request
 import base64
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .models import DecisionRequest, DecisionResult, SignalAction, Trend
 from .rules import make_decision
 
 
 RULES_FILE = Path("config/user_rules.md")
+STRATEGY_PROFILES_FILE = Path("config/strategy_profiles.json")
+
+DEFAULT_STRATEGY_PROFILES: Dict[str, Dict[str, Any]] = {
+    "short_term": {
+        "name": "短线交易",
+        "description": "15m/30m 优先，信号确认更快、止损更紧。",
+        "rules": [
+            "更重视15m触发与30m方向一致性。",
+            "止损放在最近结构位外侧，严格执行。",
+        ],
+    },
+    "swing": {
+        "name": "波段交易",
+        "description": "30m/1h 优先，持仓周期3-10天。",
+        "rules": [
+            "更关注MA20/MA40与MACD零轴持续性。",
+            "采用分批止盈：0.618先减仓，时间窗1.0/1.618再评估。",
+        ],
+    },
+    "long_term": {
+        "name": "长线交易",
+        "description": "大级别趋势优先，容忍回撤，减少频繁交易。",
+        "rules": [
+            "优先服从大级别方向，逆势信号仅用于风控。",
+            "关注趋势失效再减仓/清仓。",
+        ],
+    },
+}
 
 
 def _load_user_rules() -> str:
@@ -23,8 +51,47 @@ def _load_user_rules() -> str:
     return ""
 
 
-def _build_prompt(req: DecisionRequest) -> str:
+def _load_strategy_profiles() -> Dict[str, Dict[str, Any]]:
+    override = os.getenv("USER_STRATEGY_PROFILES_JSON")
+    if override:
+        try:
+            parsed = json.loads(override)
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+        except Exception:
+            pass
+    if STRATEGY_PROFILES_FILE.exists():
+        try:
+            parsed = json.loads(STRATEGY_PROFILES_FILE.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+        except Exception:
+            pass
+    return DEFAULT_STRATEGY_PROFILES
+
+
+def _render_strategy_rules(strategy_name: str, strategy_profile: Optional[Dict[str, Any]]) -> str:
+    if not strategy_profile:
+        return ""
+    title = strategy_profile.get("name", strategy_name)
+    description = strategy_profile.get("description", "")
+    rules = strategy_profile.get("rules", [])
+    lines = [f"策略模式: {strategy_name}（{title}）"]
+    if description:
+        lines.append(f"策略描述: {description}")
+    if isinstance(rules, list):
+        for i, rule in enumerate(rules, start=1):
+            lines.append(f"{i}. {rule}")
+    return "\n".join(lines)
+
+
+def _build_prompt(
+    req: DecisionRequest,
+    strategy_name: str = "default",
+    strategy_profile: Optional[Dict[str, Any]] = None,
+) -> str:
     user_rules = _load_user_rules()
+    strategy_rules = _render_strategy_rules(strategy_name, strategy_profile)
     payload = req.model_dump(mode="json")
     return (
         "你是期货AI决策引擎。请严格按用户规则分析，并输出可执行JSON。"
@@ -34,8 +101,11 @@ def _build_prompt(req: DecisionRequest) -> str:
         "3) 图形形态(chart_patterns)与关键结构位；"
         "4) 价格斐波那契回调(0.236/0.382/0.5/0.618/0.786)；"
         "5) 时间斐波那契窗(0.618/1.0/1.618)与波段空间估计。"
+        "同一市场可因策略周期不同得到不同建议，请按当前策略模式输出。"
         "必须遵循以下用户规则：\n"
         f"{user_rules}\n\n"
+        "必须遵循以下策略配置：\n"
+        f"{strategy_rules}\n\n"
         "输入JSON如下：\n"
         f"{json.dumps(payload, ensure_ascii=False)}\n\n"
         "请直接输出JSON，字段必须完整：\n"
@@ -117,8 +187,109 @@ def _to_decision_result(data: Dict[str, Any]) -> DecisionResult:
     return DecisionResult(**normalized)
 
 
-def _collect_model_decisions(req: DecisionRequest) -> List[Tuple[str, DecisionResult]]:
-    prompt = _build_prompt(req)
+def _fmt_range(values: Optional[List[float]]) -> str:
+    if not values:
+        return "N/A"
+    if len(values) == 1:
+        return f"{values[0]:.2f}"
+    return f"{values[0]:.2f} - {values[-1]:.2f}"
+
+
+def _compute_risk_reward_ratio(result: DecisionResult) -> Optional[float]:
+    if not result.entry_zone or result.stop_loss is None or not result.take_profit:
+        return None
+    entry = sum(result.entry_zone) / len(result.entry_zone)
+    if result.action == SignalAction.long:
+        reward = max(result.take_profit) - entry
+        risk = entry - result.stop_loss
+    elif result.action == SignalAction.short:
+        reward = entry - min(result.take_profit)
+        risk = result.stop_loss - entry
+    else:
+        return None
+    if risk <= 0 or reward <= 0:
+        return None
+    return reward / risk
+
+
+def _apply_risk_reward_filter(result: DecisionResult) -> DecisionResult:
+    rr = _compute_risk_reward_ratio(result)
+    if rr is None and result.risk_reward_ratio is not None:
+        rr = result.risk_reward_ratio
+    payload = result.model_dump()
+    payload["risk_reward_ratio"] = rr
+    payload["is_high_quality_setup"] = bool(rr is not None and rr >= 3.0) or result.is_high_quality_setup
+
+    if result.action in {SignalAction.long, SignalAction.short}:
+        if rr is None:
+            payload["action"] = SignalAction.wait
+            payload["reason"] = result.reason + ["当前无法计算有效盈亏比，建议等待更清晰的 entry/stop/take-profit。"]
+        elif rr < 3.0:
+            payload["action"] = SignalAction.wait
+            payload["reason"] = result.reason + ["当前价格已脱离安全区，盈亏比低于 3.0，建议等待回调。"]
+            payload["is_high_quality_setup"] = False
+    return DecisionResult(**payload)
+
+
+def _format_ai_decision_report(result: DecisionResult) -> str:
+    action_map = {
+        SignalAction.wait: "当前建议观望，等待更清晰信号。",
+        SignalAction.long: "符合进场做多条件。",
+        SignalAction.short: "符合进场做空条件。",
+        SignalAction.hold_long: "继续持有多单。",
+        SignalAction.hold_short: "继续持有空单。",
+        SignalAction.reduce_long: "建议多单减仓。",
+        SignalAction.reduce_short: "建议空单减仓。",
+    }
+    status = action_map.get(result.action, "建议等待确认。")
+    reasons = result.reason[:3] if result.reason else ["暂无明确依据，建议谨慎。"]
+    reason_lines = "\n".join([f"{idx + 1}. {txt}" for idx, txt in enumerate(reasons)])
+    stop_text = f"{result.stop_loss:.2f}" if result.stop_loss is not None else "N/A"
+
+    bars_text = (
+        f"约 {result.expected_remaining_bars} 根K线（根据时间窗估算）。"
+        if result.expected_remaining_bars is not None
+        else "N/A。"
+    )
+    pct_text = (
+        f"{result.expected_total_move_pct * 100:+.2f}%"
+        if result.expected_total_move_pct is not None
+        else "N/A"
+    )
+    rr_text = f"1 : {result.risk_reward_ratio:.2f}" if result.risk_reward_ratio is not None else "N/A"
+    header = "【AI 交易助手 - 高盈亏比挖掘】" if result.is_high_quality_setup else "【AI 交易助手决策报告】"
+
+    return (
+        f"{header}\n"
+        f"当前状态：{status}\n"
+        "决策依据：\n"
+        f"{reason_lines}\n"
+        "执行参数：\n"
+        f"- Entry（进场）：{_fmt_range(result.entry_zone)}\n"
+        f"- Stop（止损）：{stop_text}\n"
+        f"- Take-profit（止盈）：{_fmt_range(result.take_profit)}\n"
+        "时间/空间预判：\n"
+        f"- Expected Remaining Bars：{bars_text}\n"
+        f"- Expected Total Move Pct：{pct_text}\n"
+        f"- 风险回报比：{rr_text}\n"
+        "操作指引：\n"
+        "- 保护性止损：到达1:1后将止损上移至开仓价。\n"
+        "- 分批止盈：1:2先减仓，剩余仓位尝试MA20移动止盈。\n"
+        "- 时间止损：超过预期K线仍不达标则主动离场。"
+    )
+
+
+def _with_decision_report(result: DecisionResult) -> DecisionResult:
+    filtered = _apply_risk_reward_filter(result)
+    return DecisionResult(**{**filtered.model_dump(), "ai_decision_report": _format_ai_decision_report(filtered)})
+
+
+def _collect_model_decisions(
+    req: DecisionRequest,
+    strategy_name: str = "default",
+    strategy_profile: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[str, DecisionResult]]:
+    prompt = _build_prompt(req, strategy_name=strategy_name, strategy_profile=strategy_profile)
     outputs: List[Tuple[str, DecisionResult]] = []
 
     try:
@@ -134,8 +305,14 @@ def _collect_model_decisions(req: DecisionRequest) -> List[Tuple[str, DecisionRe
     return outputs
 
 
-def _build_vision_decision_prompt(req: DecisionRequest, timeframe: str) -> str:
+def _build_vision_decision_prompt(
+    req: DecisionRequest,
+    timeframe: str,
+    strategy_name: str = "default",
+    strategy_profile: Optional[Dict[str, Any]] = None,
+) -> str:
     user_rules = _load_user_rules()
+    strategy_rules = _render_strategy_rules(strategy_name, strategy_profile)
     return (
         "你是期货AI决策引擎。你将直接看K线图并按固定量化规则做交易决策。"
         "必须按以下顺序判断："
@@ -150,6 +327,8 @@ def _build_vision_decision_prompt(req: DecisionRequest, timeframe: str) -> str:
         f"是否要求市场过滤: {req.require_market_filter}。"
         "必须遵循以下用户规则：\n"
         f"{user_rules}\n\n"
+        "必须遵循以下策略配置：\n"
+        f"{strategy_rules}\n\n"
         "只输出JSON，字段必须完整：\n"
         "{"
         '"trend":"bullish|bearish|neutral",'
@@ -221,11 +400,19 @@ def _call_deepseek_vision_decision(prompt: str, image_bytes: bytes) -> Dict[str,
 
 
 def _collect_vision_model_decisions(
-    req: DecisionRequest, image_payloads: List[Tuple[bytes, str]]
+    req: DecisionRequest,
+    image_payloads: List[Tuple[bytes, str]],
+    strategy_name: str = "default",
+    strategy_profile: Optional[Dict[str, Any]] = None,
 ) -> List[Tuple[str, DecisionResult]]:
     outputs: List[Tuple[str, DecisionResult]] = []
     for image_bytes, timeframe in image_payloads:
-        prompt = _build_vision_decision_prompt(req, timeframe=timeframe)
+        prompt = _build_vision_decision_prompt(
+            req,
+            timeframe=timeframe,
+            strategy_name=strategy_name,
+            strategy_profile=strategy_profile,
+        )
         try:
             outputs.append((f"gemini_vision_{timeframe}", _to_decision_result(_call_gemini_vision_decision(prompt, image_bytes))))
         except Exception:
@@ -255,73 +442,120 @@ def _ensemble_decision(model_outputs: List[Tuple[str, DecisionResult]]) -> Decis
 
     actions = {d.action for _, d in model_outputs}
     if len(actions) > 1:
-        return DecisionResult(
+        return _with_decision_report(
+            DecisionResult(
             trend=chosen.trend,
             action=SignalAction.wait,
             reason=["多模型交叉验证存在分歧，先观望等待二次确认"] + merged_reason,
             expected_remaining_bars=chosen.expected_remaining_bars,
             expected_total_move_pct=chosen.expected_total_move_pct,
             confidence=max(0.35, avg_conf - 0.15),
+            )
         )
 
-    return DecisionResult(**{**chosen.model_dump(), "reason": merged_reason, "confidence": avg_conf})
+    return _with_decision_report(DecisionResult(**{**chosen.model_dump(), "reason": merged_reason, "confidence": avg_conf}))
 
 
-def hybrid_decision(req: DecisionRequest) -> DecisionResult:
+def hybrid_decision(
+    req: DecisionRequest,
+    strategy_name: str = "default",
+    strategy_profile: Optional[Dict[str, Any]] = None,
+) -> DecisionResult:
     rule_result = make_decision(req)
 
-    model_outputs = _collect_model_decisions(req)
+    model_outputs = _collect_model_decisions(req, strategy_name=strategy_name, strategy_profile=strategy_profile)
     if not model_outputs:
-        fallback_reason = ["LLM不可用（Gemini/DeepSeek均不可用），回退到规则引擎"] + rule_result.reason
-        return DecisionResult(**{**rule_result.model_dump(), "reason": fallback_reason})
+        fallback_reason = [f"策略[{strategy_name}] LLM不可用（Gemini/DeepSeek均不可用），回退到规则引擎"] + rule_result.reason
+        return _with_decision_report(DecisionResult(**{**rule_result.model_dump(), "reason": fallback_reason}))
 
     llm_result = _ensemble_decision(model_outputs)
 
     # 双模型主分析（80%）+规则风控（20%）
     risky_open = llm_result.action in {SignalAction.long, SignalAction.short}
     if rule_result.action == SignalAction.wait and risky_open:
-        return DecisionResult(
+        return _with_decision_report(
+            DecisionResult(
             trend=Trend.neutral,
             action=SignalAction.wait,
-            reason=["规则风控拦截：双模型开仓信号未通过20%风控层"] + llm_result.reason + rule_result.reason,
+            reason=[f"策略[{strategy_name}] 规则风控拦截：双模型开仓信号未通过20%风控层"]
+            + llm_result.reason
+            + rule_result.reason,
             entry_zone=None,
             stop_loss=None,
             take_profit=None,
             expected_remaining_bars=llm_result.expected_remaining_bars,
             expected_total_move_pct=llm_result.expected_total_move_pct,
             confidence=min(llm_result.confidence, rule_result.confidence),
+            )
         )
 
-    merged_reason = ["决策权重：双模型(80%) + 规则风控(20%)"] + llm_result.reason
+    merged_reason = [f"策略[{strategy_name}] 决策权重：双模型(80%) + 规则风控(20%)"] + llm_result.reason
     if rule_result.action != llm_result.action:
         merged_reason.append(f"规则引擎建议: {rule_result.action.value}")
 
-    return DecisionResult(**{**llm_result.model_dump(), "reason": merged_reason})
+    return _with_decision_report(DecisionResult(**{**llm_result.model_dump(), "reason": merged_reason}))
 
 
-def hybrid_decision_from_images(req: DecisionRequest, image_payloads: List[Tuple[bytes, str]]) -> DecisionResult:
+def hybrid_decision_from_images(
+    req: DecisionRequest,
+    image_payloads: List[Tuple[bytes, str]],
+    strategy_name: str = "default",
+    strategy_profile: Optional[Dict[str, Any]] = None,
+) -> DecisionResult:
     rule_result = make_decision(req)
-    model_outputs = _collect_vision_model_decisions(req, image_payloads=image_payloads)
+    model_outputs = _collect_vision_model_decisions(
+        req,
+        image_payloads=image_payloads,
+        strategy_name=strategy_name,
+        strategy_profile=strategy_profile,
+    )
     if not model_outputs:
-        fallback_reason = ["视觉LLM不可用（Gemini/DeepSeek均不可用），回退到规则引擎"] + rule_result.reason
-        return DecisionResult(**{**rule_result.model_dump(), "reason": fallback_reason})
+        fallback_reason = [f"策略[{strategy_name}] 视觉LLM不可用（Gemini/DeepSeek均不可用），回退到规则引擎"] + rule_result.reason
+        return _with_decision_report(DecisionResult(**{**rule_result.model_dump(), "reason": fallback_reason}))
 
     llm_result = _ensemble_decision(model_outputs)
     risky_open = llm_result.action in {SignalAction.long, SignalAction.short}
     if rule_result.action == SignalAction.wait and risky_open:
-        return DecisionResult(
+        return _with_decision_report(
+            DecisionResult(
             trend=Trend.neutral,
             action=SignalAction.wait,
-            reason=["规则风控拦截：视觉双模型开仓信号未通过20%风控层"] + llm_result.reason + rule_result.reason,
+            reason=[f"策略[{strategy_name}] 规则风控拦截：视觉双模型开仓信号未通过20%风控层"]
+            + llm_result.reason
+            + rule_result.reason,
             entry_zone=None,
             stop_loss=None,
             take_profit=None,
             expected_remaining_bars=llm_result.expected_remaining_bars,
             expected_total_move_pct=llm_result.expected_total_move_pct,
             confidence=min(llm_result.confidence, rule_result.confidence),
+            )
         )
 
-    merged_reason = ["决策来源：视觉双模型按固定量化规则判断(80%) + 规则风控(20%)"] + llm_result.reason
+    merged_reason = [f"策略[{strategy_name}] 决策来源：视觉双模型按固定量化规则判断(80%) + 规则风控(20%)"] + llm_result.reason
     if rule_result.action != llm_result.action:
         merged_reason.append(f"规则引擎建议: {rule_result.action.value}")
-    return DecisionResult(**{**llm_result.model_dump(), "reason": merged_reason})
+    return _with_decision_report(DecisionResult(**{**llm_result.model_dump(), "reason": merged_reason}))
+
+
+def hybrid_decision_multi(req: DecisionRequest) -> Dict[str, DecisionResult]:
+    profiles = _load_strategy_profiles()
+    results: Dict[str, DecisionResult] = {}
+    for strategy_name, profile in profiles.items():
+        results[strategy_name] = hybrid_decision(req, strategy_name=strategy_name, strategy_profile=profile)
+    return results
+
+
+def hybrid_decision_from_images_multi(
+    req: DecisionRequest, image_payloads: List[Tuple[bytes, str]]
+) -> Dict[str, DecisionResult]:
+    profiles = _load_strategy_profiles()
+    results: Dict[str, DecisionResult] = {}
+    for strategy_name, profile in profiles.items():
+        results[strategy_name] = hybrid_decision_from_images(
+            req,
+            image_payloads=image_payloads,
+            strategy_name=strategy_name,
+            strategy_profile=profile,
+        )
+    return results

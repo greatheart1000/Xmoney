@@ -1,4 +1,4 @@
-from app.llm_decision import hybrid_decision
+from app.llm_decision import hybrid_decision, hybrid_decision_multi
 from app.models import DecisionRequest, DecisionResult, MarketRegime, ParsedImageSignal
 
 
@@ -35,13 +35,13 @@ def test_hybrid_falls_back_without_any_llm(monkeypatch):
         )
     )
 
-    assert result.reason[0].startswith("LLM不可用")
+    assert "LLM不可用" in result.reason[0]
 
 
 def test_hybrid_uses_dual_model_consensus(monkeypatch):
     monkeypatch.setattr(
         "app.llm_decision._collect_model_decisions",
-        lambda req: [
+        lambda req, strategy_name="default", strategy_profile=None: [
             (
                 "gemini",
                 DecisionResult(
@@ -83,12 +83,14 @@ def test_hybrid_uses_dual_model_consensus(monkeypatch):
 
     assert result.action.value == "short"
     assert "双模型" in result.reason[0]
+    assert result.ai_decision_report is not None
+    assert "【AI 交易助手" in result.ai_decision_report
 
 
 def test_hybrid_waits_when_dual_models_disagree(monkeypatch):
     monkeypatch.setattr(
         "app.llm_decision._collect_model_decisions",
-        lambda req: [
+        lambda req, strategy_name="default", strategy_profile=None: [
             (
                 "gemini",
                 DecisionResult(
@@ -125,3 +127,103 @@ def test_hybrid_waits_when_dual_models_disagree(monkeypatch):
 
     assert result.action.value == "wait"
     assert any("交叉验证存在分歧" in r for r in result.reason)
+    assert result.ai_decision_report is not None
+
+
+def test_hybrid_multi_returns_three_strategy_results(monkeypatch):
+    monkeypatch.setattr(
+        "app.llm_decision._load_strategy_profiles",
+        lambda: {
+            "short_term": {"name": "短线交易", "rules": ["快进快出"]},
+            "swing": {"name": "波段交易", "rules": ["趋势段"]},
+            "long_term": {"name": "长线交易", "rules": ["大周期"]},
+        },
+    )
+    monkeypatch.setattr(
+        "app.llm_decision._collect_model_decisions",
+        lambda req, strategy_name="default", strategy_profile=None: [
+            (
+                "gemini",
+                DecisionResult(
+                    trend="bullish",
+                    action="long",
+                    reason=[f"{strategy_name} gemini long"],
+                    entry_zone=[1180, 1182],
+                    stop_loss=1176,
+                    take_profit=[1190, 1200],
+                    expected_remaining_bars=8,
+                    expected_total_move_pct=0.015,
+                    confidence=0.8,
+                ),
+            ),
+            (
+                "deepseek",
+                DecisionResult(
+                    trend="bullish",
+                    action="long",
+                    reason=[f"{strategy_name} deepseek long"],
+                    entry_zone=[1181, 1183],
+                    stop_loss=1177,
+                    take_profit=[1191, 1202],
+                    expected_remaining_bars=7,
+                    expected_total_move_pct=0.018,
+                    confidence=0.9,
+                ),
+            ),
+        ],
+    )
+
+    result = hybrid_decision_multi(
+        DecisionRequest(
+            parsed=_sample_parsed(),
+            market_regime_30m=MarketRegime.bullish,
+            market_regime_15m=MarketRegime.bullish,
+        )
+    )
+
+    assert set(result.keys()) == {"short_term", "swing", "long_term"}
+    assert all(any(f"策略[{name}]" in r for r in decision.reason) for name, decision in result.items())
+    assert all("【AI 交易助手决策报告】" in (v.ai_decision_report or "") for v in result.values())
+
+
+def test_hybrid_downgrades_open_when_rr_below_threshold(monkeypatch):
+    monkeypatch.setattr(
+        "app.llm_decision._collect_model_decisions",
+        lambda req, strategy_name="default", strategy_profile=None: [
+            (
+                "gemini",
+                DecisionResult(
+                    trend="bullish",
+                    action="long",
+                    reason=["gemini long"],
+                    entry_zone=[100, 100],
+                    stop_loss=98,
+                    take_profit=[103],  # RR = 1.5
+                    confidence=0.85,
+                ),
+            ),
+            (
+                "deepseek",
+                DecisionResult(
+                    trend="bullish",
+                    action="long",
+                    reason=["deepseek long"],
+                    entry_zone=[100, 100],
+                    stop_loss=98,
+                    take_profit=[103],  # RR = 1.5
+                    confidence=0.8,
+                ),
+            ),
+        ],
+    )
+    result = hybrid_decision(
+        DecisionRequest(
+            parsed=_sample_parsed(),
+            market_regime_30m=MarketRegime.bullish,
+            market_regime_15m=MarketRegime.bullish,
+        )
+    )
+    assert result.action.value == "wait"
+    assert result.risk_reward_ratio is not None and result.risk_reward_ratio < 3.0
+    assert result.is_high_quality_setup is False
+    assert any("盈亏比低于 3.0" in r for r in result.reason)

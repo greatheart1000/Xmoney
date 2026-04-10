@@ -2,14 +2,20 @@ from __future__ import annotations
 
 from typing import Annotated
 from datetime import datetime, timezone
+import urllib.request
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
-from .models import DecisionRequest, DecisionResult, OutcomeUpdate
-from .reporting import to_response
-from .llm_decision import hybrid_decision, hybrid_decision_from_images
-from .storage import fetch_signal, fetch_signals_by_date, init_db, insert_signal, update_outcome
+from .models import DecisionRequest, DecisionResult, OssImageSignalRequest, OutcomeUpdate
+from .reporting import backtest_summary, resolve_period_window, to_response
+from .llm_decision import (
+    hybrid_decision,
+    hybrid_decision_from_images,
+    hybrid_decision_from_images_multi,
+    hybrid_decision_multi,
+)
+from .storage import fetch_signal, fetch_signals_between, fetch_signals_by_date, init_db, insert_signal, update_outcome
 from .vision import (
     fuse_parsed_signals,
     parse_image_with_parallel_vision_models,
@@ -29,6 +35,12 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+def _download_image_from_url(url: str) -> bytes:
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        return resp.read()
+
+
 @app.post("/api/v1/parse-image")
 async def parse_image(symbol: str, timeframe: str, image: UploadFile = File(...)) -> dict:
     data = await image.read()
@@ -39,6 +51,12 @@ async def parse_image(symbol: str, timeframe: str, image: UploadFile = File(...)
 @app.post("/api/v1/decision", response_model=DecisionResult)
 def decision(req: DecisionRequest) -> DecisionResult:
     return hybrid_decision(req)
+
+
+@app.post("/api/v1/decision/multi")
+def decision_multi(req: DecisionRequest) -> dict:
+    decisions = hybrid_decision_multi(req)
+    return {"strategies": {k: v.model_dump() for k, v in decisions.items()}}
 
 
 @app.post("/api/v1/signal-from-image")
@@ -65,10 +83,55 @@ async def signal_from_image(
             "parsed": parsed.model_dump(),
             "decision": result.model_dump(),
         },
+        "image_uri": None,
         "outcome_return": None,
     }
     signal_id = insert_signal(record)
     return {"signal_id": signal_id, "parsed": parsed, "decision": result}
+
+
+@app.post("/api/v1/signal-from-oss-image")
+def signal_from_oss_image(req: OssImageSignalRequest) -> dict:
+    try:
+        image_bytes = _download_image_from_url(req.image_url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"download image failed: {exc}") from exc
+
+    parsed = parse_image_with_parallel_vision_models(image_bytes, symbol=req.symbol, timeframe=req.timeframe)
+    decision_req = DecisionRequest(parsed=parsed, position=req.position)
+    result = hybrid_decision_from_images(decision_req, image_payloads=[(image_bytes, req.timeframe)])
+
+    record = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "symbol": parsed.symbol,
+        "timeframe": parsed.timeframe,
+        "position": req.position,
+        "trend": result.trend.value,
+        "action": result.action.value,
+        "confidence": result.confidence,
+        "payload": {
+            "parsed": parsed.model_dump(),
+            "decision": result.model_dump(),
+        },
+        "image_uri": req.image_url,
+        "outcome_return": None,
+    }
+    signal_id = insert_signal(record)
+    return {"signal_id": signal_id, "image_url": req.image_url, "parsed": parsed, "decision": result}
+
+
+@app.post("/api/v1/signal-from-image/multi")
+async def signal_from_image_multi(
+    symbol: str,
+    timeframe: str,
+    position: Annotated[str, Query(pattern="^(flat|long|short)$")] = "flat",
+    image: UploadFile = File(...),
+) -> dict:
+    data = await image.read()
+    parsed = parse_image_with_parallel_vision_models(data, symbol=symbol, timeframe=timeframe)
+    req = DecisionRequest(parsed=parsed, position=position)
+    decisions = hybrid_decision_from_images_multi(req, image_payloads=[(data, timeframe)])
+    return {"parsed": parsed, "strategies": {k: v.model_dump() for k, v in decisions.items()}}
 
 
 @app.post("/api/v1/signal-from-images")
@@ -138,3 +201,11 @@ def daily_report_html(date: str):
     rows = fetch_signals_by_date(date)
     report = to_response(date, rows)
     return FileResponse(report.html_path)
+
+
+@app.get("/api/v1/backtest/summary")
+def backtest_summary_api(period: str = "1d") -> dict:
+    start_dt, end_dt = resolve_period_window(period=period)
+    rows = fetch_signals_between(start_dt.isoformat(), end_dt.isoformat())
+    summary = backtest_summary(rows, period_start=start_dt, period_end=end_dt)
+    return summary.model_dump()

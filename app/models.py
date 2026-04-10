@@ -79,6 +79,9 @@ class DecisionResult(BaseModel):
     take_profit: Optional[List[float]] = None
     expected_remaining_bars: Optional[int] = None
     expected_total_move_pct: Optional[float] = None
+    risk_reward_ratio: Optional[float] = None
+    is_high_quality_setup: bool = False
+    ai_decision_report: Optional[str] = None
     confidence: float
 
 
@@ -116,3 +119,25 @@ class DailyReportResponse(BaseModel):
     stats: DailyStats
     chart_path: str
     html_path: str
+
+
+class BacktestSummary(BaseModel):
+    period_start: str
+    period_end: str
+    total_signals: int
+    evaluated_signals: int
+    correct_signals: int
+    accuracy: float
+    long_short_signals: int
+    long_short_accuracy: float
+    wait_signals: int
+    wait_accuracy: float
+    high_quality_signals: int
+    high_quality_accuracy: float
+
+
+class OssImageSignalRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    image_url: str
+    position: str = Field(default="flat", pattern="^(flat|long|short)$")

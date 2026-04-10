@@ -24,10 +24,14 @@ def init_db() -> None:
                 action TEXT NOT NULL,
                 confidence REAL NOT NULL,
                 payload TEXT NOT NULL,
+                image_uri TEXT,
                 outcome_return REAL
             )
             """
         )
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
+        if "image_uri" not in cols:
+            conn.execute("ALTER TABLE signals ADD COLUMN image_uri TEXT")
         conn.commit()
 
 
@@ -37,8 +41,8 @@ def insert_signal(record: Dict[str, Any]) -> int:
             """
             INSERT INTO signals (
                 created_at, symbol, timeframe, position, trend, action,
-                confidence, payload, outcome_return
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                confidence, payload, image_uri, outcome_return
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record["created_at"],
@@ -49,6 +53,7 @@ def insert_signal(record: Dict[str, Any]) -> int:
                 record["action"],
                 record["confidence"],
                 json.dumps(record["payload"], ensure_ascii=False),
+                record.get("image_uri"),
                 record.get("outcome_return"),
             ),
         )
@@ -95,3 +100,22 @@ def fetch_signal(signal_id: int) -> Optional[Dict[str, Any]]:
     d = dict(row)
     d["payload"] = json.loads(d["payload"])
     return d
+
+
+def fetch_signals_between(start_iso: str, end_iso: str) -> List[Dict[str, Any]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM signals
+            WHERE created_at BETWEEN ? AND ?
+            ORDER BY created_at ASC
+            """,
+            (start_iso, end_iso),
+        ).fetchall()
+    result = []
+    for row in rows:
+        d = dict(row)
+        d["payload"] = json.loads(d["payload"])
+        result.append(d)
+    return result
