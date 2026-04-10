@@ -49,15 +49,15 @@ def test_fuse_parsed_signals_prefers_higher_timeframe_weight():
 
 def test_signal_from_images_returns_single_decision(monkeypatch):
     monkeypatch.setattr(
-        "app.main.parse_images_with_gemini",
+        "app.main.parse_images_with_parallel_vision_models",
         lambda payloads, symbol: [
             _parsed(symbol, "5m", 100, 0.6),
             _parsed(symbol, "15m", 110, 0.7),
         ],
     )
     monkeypatch.setattr(
-        "app.main.hybrid_decision",
-        lambda req: DecisionResult(
+        "app.main.hybrid_decision_from_images",
+        lambda req, image_payloads: DecisionResult(
             trend="bearish",
             action="wait",
             reason=["ok"],
