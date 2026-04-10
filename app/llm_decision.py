@@ -5,13 +5,41 @@ import os
 import urllib.request
 import base64
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .models import DecisionRequest, DecisionResult, SignalAction, Trend
 from .rules import make_decision
 
 
 RULES_FILE = Path("config/user_rules.md")
+STRATEGY_PROFILES_FILE = Path("config/strategy_profiles.json")
+
+DEFAULT_STRATEGY_PROFILES: Dict[str, Dict[str, Any]] = {
+    "short_term": {
+        "name": "短线交易",
+        "description": "15m/30m 优先，信号确认更快、止损更紧。",
+        "rules": [
+            "更重视15m触发与30m方向一致性。",
+            "止损放在最近结构位外侧，严格执行。",
+        ],
+    },
+    "swing": {
+        "name": "波段交易",
+        "description": "30m/1h 优先，持仓周期3-10天。",
+        "rules": [
+            "更关注MA20/MA40与MACD零轴持续性。",
+            "采用分批止盈：0.618先减仓，时间窗1.0/1.618再评估。",
+        ],
+    },
+    "long_term": {
+        "name": "长线交易",
+        "description": "大级别趋势优先，容忍回撤，减少频繁交易。",
+        "rules": [
+            "优先服从大级别方向，逆势信号仅用于风控。",
+            "关注趋势失效再减仓/清仓。",
+        ],
+    },
+}
 
 
 def _load_user_rules() -> str:
@@ -23,8 +51,47 @@ def _load_user_rules() -> str:
     return ""
 
 
-def _build_prompt(req: DecisionRequest) -> str:
+def _load_strategy_profiles() -> Dict[str, Dict[str, Any]]:
+    override = os.getenv("USER_STRATEGY_PROFILES_JSON")
+    if override:
+        try:
+            parsed = json.loads(override)
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+        except Exception:
+            pass
+    if STRATEGY_PROFILES_FILE.exists():
+        try:
+            parsed = json.loads(STRATEGY_PROFILES_FILE.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+        except Exception:
+            pass
+    return DEFAULT_STRATEGY_PROFILES
+
+
+def _render_strategy_rules(strategy_name: str, strategy_profile: Optional[Dict[str, Any]]) -> str:
+    if not strategy_profile:
+        return ""
+    title = strategy_profile.get("name", strategy_name)
+    description = strategy_profile.get("description", "")
+    rules = strategy_profile.get("rules", [])
+    lines = [f"策略模式: {strategy_name}（{title}）"]
+    if description:
+        lines.append(f"策略描述: {description}")
+    if isinstance(rules, list):
+        for i, rule in enumerate(rules, start=1):
+            lines.append(f"{i}. {rule}")
+    return "\n".join(lines)
+
+
+def _build_prompt(
+    req: DecisionRequest,
+    strategy_name: str = "default",
+    strategy_profile: Optional[Dict[str, Any]] = None,
+) -> str:
     user_rules = _load_user_rules()
+    strategy_rules = _render_strategy_rules(strategy_name, strategy_profile)
     payload = req.model_dump(mode="json")
     return (
         "你是期货AI决策引擎。请严格按用户规则分析，并输出可执行JSON。"
@@ -34,8 +101,11 @@ def _build_prompt(req: DecisionRequest) -> str:
         "3) 图形形态(chart_patterns)与关键结构位；"
         "4) 价格斐波那契回调(0.236/0.382/0.5/0.618/0.786)；"
         "5) 时间斐波那契窗(0.618/1.0/1.618)与波段空间估计。"
+        "同一市场可因策略周期不同得到不同建议，请按当前策略模式输出。"
         "必须遵循以下用户规则：\n"
         f"{user_rules}\n\n"
+        "必须遵循以下策略配置：\n"
+        f"{strategy_rules}\n\n"
         "输入JSON如下：\n"
         f"{json.dumps(payload, ensure_ascii=False)}\n\n"
         "请直接输出JSON，字段必须完整：\n"
@@ -117,8 +187,12 @@ def _to_decision_result(data: Dict[str, Any]) -> DecisionResult:
     return DecisionResult(**normalized)
 
 
-def _collect_model_decisions(req: DecisionRequest) -> List[Tuple[str, DecisionResult]]:
-    prompt = _build_prompt(req)
+def _collect_model_decisions(
+    req: DecisionRequest,
+    strategy_name: str = "default",
+    strategy_profile: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[str, DecisionResult]]:
+    prompt = _build_prompt(req, strategy_name=strategy_name, strategy_profile=strategy_profile)
     outputs: List[Tuple[str, DecisionResult]] = []
 
     try:
@@ -134,8 +208,14 @@ def _collect_model_decisions(req: DecisionRequest) -> List[Tuple[str, DecisionRe
     return outputs
 
 
-def _build_vision_decision_prompt(req: DecisionRequest, timeframe: str) -> str:
+def _build_vision_decision_prompt(
+    req: DecisionRequest,
+    timeframe: str,
+    strategy_name: str = "default",
+    strategy_profile: Optional[Dict[str, Any]] = None,
+) -> str:
     user_rules = _load_user_rules()
+    strategy_rules = _render_strategy_rules(strategy_name, strategy_profile)
     return (
         "你是期货AI决策引擎。你将直接看K线图并按固定量化规则做交易决策。"
         "必须按以下顺序判断："
@@ -150,6 +230,8 @@ def _build_vision_decision_prompt(req: DecisionRequest, timeframe: str) -> str:
         f"是否要求市场过滤: {req.require_market_filter}。"
         "必须遵循以下用户规则：\n"
         f"{user_rules}\n\n"
+        "必须遵循以下策略配置：\n"
+        f"{strategy_rules}\n\n"
         "只输出JSON，字段必须完整：\n"
         "{"
         '"trend":"bullish|bearish|neutral",'
@@ -221,11 +303,19 @@ def _call_deepseek_vision_decision(prompt: str, image_bytes: bytes) -> Dict[str,
 
 
 def _collect_vision_model_decisions(
-    req: DecisionRequest, image_payloads: List[Tuple[bytes, str]]
+    req: DecisionRequest,
+    image_payloads: List[Tuple[bytes, str]],
+    strategy_name: str = "default",
+    strategy_profile: Optional[Dict[str, Any]] = None,
 ) -> List[Tuple[str, DecisionResult]]:
     outputs: List[Tuple[str, DecisionResult]] = []
     for image_bytes, timeframe in image_payloads:
-        prompt = _build_vision_decision_prompt(req, timeframe=timeframe)
+        prompt = _build_vision_decision_prompt(
+            req,
+            timeframe=timeframe,
+            strategy_name=strategy_name,
+            strategy_profile=strategy_profile,
+        )
         try:
             outputs.append((f"gemini_vision_{timeframe}", _to_decision_result(_call_gemini_vision_decision(prompt, image_bytes))))
         except Exception:
@@ -267,12 +357,16 @@ def _ensemble_decision(model_outputs: List[Tuple[str, DecisionResult]]) -> Decis
     return DecisionResult(**{**chosen.model_dump(), "reason": merged_reason, "confidence": avg_conf})
 
 
-def hybrid_decision(req: DecisionRequest) -> DecisionResult:
+def hybrid_decision(
+    req: DecisionRequest,
+    strategy_name: str = "default",
+    strategy_profile: Optional[Dict[str, Any]] = None,
+) -> DecisionResult:
     rule_result = make_decision(req)
 
-    model_outputs = _collect_model_decisions(req)
+    model_outputs = _collect_model_decisions(req, strategy_name=strategy_name, strategy_profile=strategy_profile)
     if not model_outputs:
-        fallback_reason = ["LLM不可用（Gemini/DeepSeek均不可用），回退到规则引擎"] + rule_result.reason
+        fallback_reason = [f"策略[{strategy_name}] LLM不可用（Gemini/DeepSeek均不可用），回退到规则引擎"] + rule_result.reason
         return DecisionResult(**{**rule_result.model_dump(), "reason": fallback_reason})
 
     llm_result = _ensemble_decision(model_outputs)
@@ -283,7 +377,9 @@ def hybrid_decision(req: DecisionRequest) -> DecisionResult:
         return DecisionResult(
             trend=Trend.neutral,
             action=SignalAction.wait,
-            reason=["规则风控拦截：双模型开仓信号未通过20%风控层"] + llm_result.reason + rule_result.reason,
+            reason=[f"策略[{strategy_name}] 规则风控拦截：双模型开仓信号未通过20%风控层"]
+            + llm_result.reason
+            + rule_result.reason,
             entry_zone=None,
             stop_loss=None,
             take_profit=None,
@@ -292,18 +388,28 @@ def hybrid_decision(req: DecisionRequest) -> DecisionResult:
             confidence=min(llm_result.confidence, rule_result.confidence),
         )
 
-    merged_reason = ["决策权重：双模型(80%) + 规则风控(20%)"] + llm_result.reason
+    merged_reason = [f"策略[{strategy_name}] 决策权重：双模型(80%) + 规则风控(20%)"] + llm_result.reason
     if rule_result.action != llm_result.action:
         merged_reason.append(f"规则引擎建议: {rule_result.action.value}")
 
     return DecisionResult(**{**llm_result.model_dump(), "reason": merged_reason})
 
 
-def hybrid_decision_from_images(req: DecisionRequest, image_payloads: List[Tuple[bytes, str]]) -> DecisionResult:
+def hybrid_decision_from_images(
+    req: DecisionRequest,
+    image_payloads: List[Tuple[bytes, str]],
+    strategy_name: str = "default",
+    strategy_profile: Optional[Dict[str, Any]] = None,
+) -> DecisionResult:
     rule_result = make_decision(req)
-    model_outputs = _collect_vision_model_decisions(req, image_payloads=image_payloads)
+    model_outputs = _collect_vision_model_decisions(
+        req,
+        image_payloads=image_payloads,
+        strategy_name=strategy_name,
+        strategy_profile=strategy_profile,
+    )
     if not model_outputs:
-        fallback_reason = ["视觉LLM不可用（Gemini/DeepSeek均不可用），回退到规则引擎"] + rule_result.reason
+        fallback_reason = [f"策略[{strategy_name}] 视觉LLM不可用（Gemini/DeepSeek均不可用），回退到规则引擎"] + rule_result.reason
         return DecisionResult(**{**rule_result.model_dump(), "reason": fallback_reason})
 
     llm_result = _ensemble_decision(model_outputs)
@@ -312,7 +418,9 @@ def hybrid_decision_from_images(req: DecisionRequest, image_payloads: List[Tuple
         return DecisionResult(
             trend=Trend.neutral,
             action=SignalAction.wait,
-            reason=["规则风控拦截：视觉双模型开仓信号未通过20%风控层"] + llm_result.reason + rule_result.reason,
+            reason=[f"策略[{strategy_name}] 规则风控拦截：视觉双模型开仓信号未通过20%风控层"]
+            + llm_result.reason
+            + rule_result.reason,
             entry_zone=None,
             stop_loss=None,
             take_profit=None,
@@ -321,7 +429,30 @@ def hybrid_decision_from_images(req: DecisionRequest, image_payloads: List[Tuple
             confidence=min(llm_result.confidence, rule_result.confidence),
         )
 
-    merged_reason = ["决策来源：视觉双模型按固定量化规则判断(80%) + 规则风控(20%)"] + llm_result.reason
+    merged_reason = [f"策略[{strategy_name}] 决策来源：视觉双模型按固定量化规则判断(80%) + 规则风控(20%)"] + llm_result.reason
     if rule_result.action != llm_result.action:
         merged_reason.append(f"规则引擎建议: {rule_result.action.value}")
     return DecisionResult(**{**llm_result.model_dump(), "reason": merged_reason})
+
+
+def hybrid_decision_multi(req: DecisionRequest) -> Dict[str, DecisionResult]:
+    profiles = _load_strategy_profiles()
+    results: Dict[str, DecisionResult] = {}
+    for strategy_name, profile in profiles.items():
+        results[strategy_name] = hybrid_decision(req, strategy_name=strategy_name, strategy_profile=profile)
+    return results
+
+
+def hybrid_decision_from_images_multi(
+    req: DecisionRequest, image_payloads: List[Tuple[bytes, str]]
+) -> Dict[str, DecisionResult]:
+    profiles = _load_strategy_profiles()
+    results: Dict[str, DecisionResult] = {}
+    for strategy_name, profile in profiles.items():
+        results[strategy_name] = hybrid_decision_from_images(
+            req,
+            image_payloads=image_payloads,
+            strategy_name=strategy_name,
+            strategy_profile=profile,
+        )
+    return results
