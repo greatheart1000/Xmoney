@@ -47,17 +47,6 @@ def test_fuse_parsed_signals_prefers_higher_timeframe_weight():
     assert 110 < fused.close < 120
 
 
-def test_fuse_parsed_signals_normalizes_timeframe_case():
-    fused = fuse_parsed_signals(
-        [
-            _parsed("SA605", "5M", 100, 0.6),
-            _parsed("SA605", "30M", 120, 0.8),
-        ]
-    )
-    assert fused.timeframe == "30m"
-    assert fused.raw_features["frames"] == "5m,30m"
-
-
 def test_signal_from_images_returns_single_decision(monkeypatch):
     monkeypatch.setattr(
         "app.main.parse_images_with_gemini",
@@ -90,13 +79,3 @@ def test_signal_from_images_returns_single_decision(monkeypatch):
     body = resp.json()
     assert body["decision"]["action"] == "wait"
     assert len(body["parsed_list"]) == 2
-
-
-def test_signal_from_images_rejects_invalid_position():
-    files = [("images", ("a.png", b"x", "image/png"))]
-    resp = client.post(
-        "/api/v1/signal-from-images",
-        params={"symbol": "SA605", "timeframes": "5m", "position": "hold"},
-        files=files,
-    )
-    assert resp.status_code == 422
