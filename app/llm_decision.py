@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
+import base64
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -133,6 +134,111 @@ def _collect_model_decisions(req: DecisionRequest) -> List[Tuple[str, DecisionRe
     return outputs
 
 
+def _build_vision_decision_prompt(req: DecisionRequest, timeframe: str) -> str:
+    user_rules = _load_user_rules()
+    return (
+        "你是期货AI决策引擎。你将直接看K线图并按固定量化规则做交易决策。"
+        "必须按以下顺序判断："
+        "1) 先看文华商品指数30m，再看15m确认；"
+        "2) 再看该品种图上MA/MACD/成交量/持仓量；"
+        "3) 识别形态与关键结构位；"
+        "4) 结合价格斐波那契回调位(0.236/0.382/0.5/0.618/0.786)；"
+        "5) 结合斐波那契时间窗(0.618/1.0/1.618)估计剩余bar与波段空间。"
+        "你必须给出交易动作：wait|long|short|hold_long|hold_short|reduce_long|reduce_short。"
+        f"当前持仓: {req.position}。图表周期: {timeframe}。"
+        f"市场过滤30m: {req.market_regime_30m.value}, 15m: {req.market_regime_15m.value}。"
+        f"是否要求市场过滤: {req.require_market_filter}。"
+        "必须遵循以下用户规则：\n"
+        f"{user_rules}\n\n"
+        "只输出JSON，字段必须完整：\n"
+        "{"
+        '"trend":"bullish|bearish|neutral",'
+        '"action":"wait|long|short|hold_long|hold_short|reduce_long|reduce_short",'
+        '"reason":["..."],'
+        '"entry_zone":[0,0],'
+        '"stop_loss":0,'
+        '"take_profit":[0,0],'
+        '"expected_remaining_bars":0,'
+        '"expected_total_move_pct":0.0,'
+        '"confidence":0.0'
+        "}"
+    )
+
+
+def _call_gemini_vision_decision(prompt: str, image_bytes: bytes) -> Dict[str, Any]:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY")
+    import google.generativeai as genai
+
+    genai.configure(api_key=api_key)
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+    model = genai.GenerativeModel(model_name=model_name)
+    resp = model.generate_content(
+        [
+            {"mime_type": "image/png", "data": image_bytes},
+            prompt,
+        ],
+        generation_config={"response_mime_type": "application/json", "temperature": 0.2},
+    )
+    return json.loads(resp.text)
+
+
+def _call_deepseek_vision_decision(prompt: str, image_bytes: bytes) -> Dict[str, Any]:
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing DEEPSEEK_API_KEY")
+    url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/chat/completions")
+    model = os.getenv("DEEPSEEK_VL_MODEL", os.getenv("DEEPSEEK_MODEL", "deepseek-chat"))
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    payload = {
+        "model": model,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": "你是期货图像决策AI，请严格按规则，只输出JSON。"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+                ],
+            },
+        ],
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    content = body["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+
+def _collect_vision_model_decisions(
+    req: DecisionRequest, image_payloads: List[Tuple[bytes, str]]
+) -> List[Tuple[str, DecisionResult]]:
+    outputs: List[Tuple[str, DecisionResult]] = []
+    for image_bytes, timeframe in image_payloads:
+        prompt = _build_vision_decision_prompt(req, timeframe=timeframe)
+        try:
+            outputs.append((f"gemini_vision_{timeframe}", _to_decision_result(_call_gemini_vision_decision(prompt, image_bytes))))
+        except Exception:
+            pass
+        try:
+            outputs.append(
+                (f"deepseek_vision_{timeframe}", _to_decision_result(_call_deepseek_vision_decision(prompt, image_bytes)))
+            )
+        except Exception:
+            pass
+    return outputs
+
+
 def _ensemble_decision(model_outputs: List[Tuple[str, DecisionResult]]) -> DecisionResult:
     # 多模型交叉验证：优先一致性，分歧时保持保守
     vote: Dict[SignalAction, int] = {}
@@ -190,4 +296,32 @@ def hybrid_decision(req: DecisionRequest) -> DecisionResult:
     if rule_result.action != llm_result.action:
         merged_reason.append(f"规则引擎建议: {rule_result.action.value}")
 
+    return DecisionResult(**{**llm_result.model_dump(), "reason": merged_reason})
+
+
+def hybrid_decision_from_images(req: DecisionRequest, image_payloads: List[Tuple[bytes, str]]) -> DecisionResult:
+    rule_result = make_decision(req)
+    model_outputs = _collect_vision_model_decisions(req, image_payloads=image_payloads)
+    if not model_outputs:
+        fallback_reason = ["视觉LLM不可用（Gemini/DeepSeek均不可用），回退到规则引擎"] + rule_result.reason
+        return DecisionResult(**{**rule_result.model_dump(), "reason": fallback_reason})
+
+    llm_result = _ensemble_decision(model_outputs)
+    risky_open = llm_result.action in {SignalAction.long, SignalAction.short}
+    if rule_result.action == SignalAction.wait and risky_open:
+        return DecisionResult(
+            trend=Trend.neutral,
+            action=SignalAction.wait,
+            reason=["规则风控拦截：视觉双模型开仓信号未通过20%风控层"] + llm_result.reason + rule_result.reason,
+            entry_zone=None,
+            stop_loss=None,
+            take_profit=None,
+            expected_remaining_bars=llm_result.expected_remaining_bars,
+            expected_total_move_pct=llm_result.expected_total_move_pct,
+            confidence=min(llm_result.confidence, rule_result.confidence),
+        )
+
+    merged_reason = ["决策来源：视觉双模型按固定量化规则判断(80%) + 规则风控(20%)"] + llm_result.reason
+    if rule_result.action != llm_result.action:
+        merged_reason.append(f"规则引擎建议: {rule_result.action.value}")
     return DecisionResult(**{**llm_result.model_dump(), "reason": merged_reason})

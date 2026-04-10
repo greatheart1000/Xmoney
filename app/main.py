@@ -8,9 +8,13 @@ from fastapi.responses import FileResponse
 
 from .models import DecisionRequest, DecisionResult, OutcomeUpdate
 from .reporting import to_response
-from .llm_decision import hybrid_decision
+from .llm_decision import hybrid_decision, hybrid_decision_from_images
 from .storage import fetch_signal, fetch_signals_by_date, init_db, insert_signal, update_outcome
-from .vision import fuse_parsed_signals, parse_image_with_gemini, parse_images_with_gemini
+from .vision import (
+    fuse_parsed_signals,
+    parse_image_with_parallel_vision_models,
+    parse_images_with_parallel_vision_models,
+)
 
 app = FastAPI(title="AI Futures Decision System", version="1.0.0")
 
@@ -28,7 +32,7 @@ def health() -> dict:
 @app.post("/api/v1/parse-image")
 async def parse_image(symbol: str, timeframe: str, image: UploadFile = File(...)) -> dict:
     data = await image.read()
-    parsed = parse_image_with_gemini(data, symbol=symbol, timeframe=timeframe)
+    parsed = parse_image_with_parallel_vision_models(data, symbol=symbol, timeframe=timeframe)
     return parsed.model_dump()
 
 
@@ -45,9 +49,9 @@ async def signal_from_image(
     image: UploadFile = File(...),
 ) -> dict:
     data = await image.read()
-    parsed = parse_image_with_gemini(data, symbol=symbol, timeframe=timeframe)
+    parsed = parse_image_with_parallel_vision_models(data, symbol=symbol, timeframe=timeframe)
     req = DecisionRequest(parsed=parsed, position=position)
-    result = hybrid_decision(req)
+    result = hybrid_decision_from_images(req, image_payloads=[(data, timeframe)])
 
     record = {
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -84,10 +88,10 @@ async def signal_from_images(
     for frame, image in zip(frames, images):
         payloads.append((await image.read(), frame))
 
-    parsed_list = parse_images_with_gemini(payloads, symbol=symbol)
+    parsed_list = parse_images_with_parallel_vision_models(payloads, symbol=symbol)
     fused_parsed = fuse_parsed_signals(parsed_list)
     req = DecisionRequest(parsed=fused_parsed, position=position)
-    result = hybrid_decision(req)
+    result = hybrid_decision_from_images(req, image_payloads=payloads)
 
     record = {
         "created_at": datetime.now(timezone.utc).isoformat(),

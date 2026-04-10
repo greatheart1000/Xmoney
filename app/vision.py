@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
+import urllib.request
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from .models import ParsedImageSignal
@@ -104,9 +106,108 @@ def parse_image_with_gemini(image_bytes: bytes, symbol: str, timeframe: str) -> 
     return ParsedImageSignal(**data)
 
 
+def parse_image_with_deepseek_vl(image_bytes: bytes, symbol: str, timeframe: str) -> ParsedImageSignal:
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        return _mock_parse(symbol, timeframe)
+
+    url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/chat/completions")
+    model = os.getenv("DEEPSEEK_VL_MODEL", os.getenv("DEEPSEEK_MODEL", "deepseek-chat"))
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    payload = {
+        "model": model,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": "你是期货技术图像解析器，只返回JSON。"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+                ],
+            },
+        ],
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    content = body["choices"][0]["message"]["content"]
+    data: Dict[str, Any] = json.loads(content)
+    data["symbol"] = symbol
+    data["timeframe"] = timeframe
+    return ParsedImageSignal(**data)
+
+
+def _compare_signal_consistency(primary: ParsedImageSignal, secondary: ParsedImageSignal) -> Tuple[float, Dict[str, str]]:
+    checks = {
+        "ma_order": (primary.ma5 > primary.ma20) == (secondary.ma5 > secondary.ma20),
+        "macd_bias": (primary.macd_hist >= 0) == (secondary.macd_hist >= 0),
+        "price_vs_ma20": (primary.close >= primary.ma20) == (secondary.close >= secondary.ma20),
+        "levels_overlap": bool(set(round(x, 2) for x in primary.support_levels) & set(round(x, 2) for x in secondary.support_levels))
+        or bool(set(round(x, 2) for x in primary.resistance_levels) & set(round(x, 2) for x in secondary.resistance_levels)),
+    }
+    score = sum(1 for ok in checks.values() if ok) / len(checks)
+    notes = {f"consistency_{k}": str(v).lower() for k, v in checks.items()}
+    notes["consistency_score"] = f"{score:.2f}"
+    return score, notes
+
+
+def parse_image_with_parallel_vision_models(image_bytes: bytes, symbol: str, timeframe: str) -> ParsedImageSignal:
+    outputs: List[Tuple[str, ParsedImageSignal]] = []
+
+    try:
+        outputs.append(("gemini", parse_image_with_gemini(image_bytes=image_bytes, symbol=symbol, timeframe=timeframe)))
+    except Exception:
+        pass
+
+    try:
+        outputs.append(("deepseek_vl", parse_image_with_deepseek_vl(image_bytes=image_bytes, symbol=symbol, timeframe=timeframe)))
+    except Exception:
+        pass
+
+    if not outputs:
+        return _mock_parse(symbol, timeframe)
+    if len(outputs) == 1:
+        only = outputs[0][1]
+        only.raw_features.update({"vision_models": outputs[0][0], "consistency_score": "1.00"})
+        return only
+
+    first, second = outputs[0][1], outputs[1][1]
+    consistency, notes = _compare_signal_consistency(first, second)
+    fused = fuse_parsed_signals([first, second])
+    fused.raw_features.update(notes)
+    fused.raw_features["vision_models"] = ",".join(name for name, _ in outputs)
+    fused.raw_features["selected_strategy"] = "fuse" if consistency >= 0.5 else "high_confidence"
+    if consistency < 0.5:
+        chosen = max((s for _, s in outputs), key=lambda x: x.confidence)
+        chosen.raw_features.update(notes)
+        chosen.raw_features["vision_models"] = ",".join(name for name, _ in outputs)
+        chosen.raw_features["selected_strategy"] = "high_confidence"
+        return chosen
+    return fused
+
+
 def parse_images_with_gemini(image_payloads: Sequence[Tuple[bytes, str]], symbol: str) -> List[ParsedImageSignal]:
     return [
         parse_image_with_gemini(image_bytes=image_bytes, symbol=symbol, timeframe=timeframe)
+        for image_bytes, timeframe in image_payloads
+    ]
+
+
+def parse_images_with_parallel_vision_models(
+    image_payloads: Sequence[Tuple[bytes, str]], symbol: str
+) -> List[ParsedImageSignal]:
+    return [
+        parse_image_with_parallel_vision_models(image_bytes=image_bytes, symbol=symbol, timeframe=timeframe)
         for image_bytes, timeframe in image_payloads
     ]
 
