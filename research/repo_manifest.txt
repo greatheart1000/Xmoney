@@ -1,0 +1,10 @@
+https://github.com/vnpy/vnpy|cn_futures/vnpy
+https://github.com/QuantConnect/Lean|multi_asset/lean
+https://github.com/freqtrade/freqtrade|crypto/freqtrade
+https://github.com/nautechsystems/nautilus_trader|multi_asset/nautilus_trader
+https://github.com/mementum/backtrader|multi_asset/backtrader
+https://github.com/hummingbot/hummingbot|crypto/hummingbot
+https://github.com/StockSharp/StockSharp|multi_asset/stocksharp
+https://github.com/AI4Finance-Foundation/FinRL|multi_asset/finrl
+https://github.com/ricequant/rqalpha|cn_stocks_futures/rqalpha
+https://github.com/polakowo/vectorbt|research/vectorbt

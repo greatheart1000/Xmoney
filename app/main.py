@@ -1,26 +1,34 @@
 from __future__ import annotations
 
-from typing import Annotated
-from datetime import datetime, timezone
 import ipaddress
 import os
 import socket
-from urllib.parse import urljoin, urlparse
+import traceback
 import urllib.request
+from datetime import datetime, timezone
+from typing import Annotated
 from urllib.error import HTTPError
+from urllib.parse import urljoin, urlparse
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 
-from .models import DecisionRequest, DecisionResult, OssImageSignalRequest, OutcomeUpdate
-from .reporting import to_response
 from .llm_decision import (
-    hybrid_decision,
     hybrid_decision_from_images,
     hybrid_decision_from_images_multi,
     hybrid_decision_multi,
 )
-from .storage import fetch_signal, fetch_signals_by_date, init_db, insert_signal, update_outcome
+from .models import AssetClass, DecisionRequest, DecisionResult, OssImageSignalRequest, OutcomeUpdate
+from .reporting import backtest_summary, resolve_period_window, to_response
+from .runtime.engine import run_decision_pipeline
+from .storage import (
+    fetch_signal,
+    fetch_signals_between,
+    fetch_signals_by_date,
+    init_db,
+    insert_signal,
+    update_outcome,
+)
 from .vision import (
     fuse_parsed_signals,
     parse_image_with_parallel_vision_models,
@@ -28,6 +36,18 @@ from .vision import (
 )
 
 app = FastAPI(title="AI Futures Decision System", version="1.0.0")
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": str(exc),
+            "detail": traceback.format_exc(),
+            "timestamp": datetime.now().isoformat(),
+        },
+    )
 
 
 @app.on_event("startup")
@@ -75,13 +95,10 @@ def _validate_external_image_url(url: str) -> str:
     host = parsed.hostname.lower()
     if _ALLOWED_IMAGE_HOSTS and host not in _ALLOWED_IMAGE_HOSTS:
         raise HTTPException(status_code=400, detail="image_url host is not allowlisted")
-
     if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".local"):
         raise HTTPException(status_code=400, detail="image_url host is not allowed")
-
     if _is_private_or_local_host(host):
         raise HTTPException(status_code=400, detail="image_url resolves to a private/local address")
-
     return url
 
 
@@ -108,6 +125,32 @@ def _download_image_from_url(url: str) -> bytes:
     raise HTTPException(status_code=400, detail="too many redirects for image_url")
 
 
+def _build_signal_record(
+    req: DecisionRequest,
+    result: DecisionResult,
+    payload: dict,
+    *,
+    image_uri: str | None = None,
+) -> dict:
+    return {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "symbol": req.parsed.symbol,
+        "timeframe": req.parsed.timeframe,
+        "position": req.position,
+        "asset_class": req.asset_class.value,
+        "exchange": req.exchange,
+        "instrument_type": req.instrument_type,
+        "strategy_id": req.strategy_id,
+        "risk_verdict": result.risk_verdict,
+        "trend": result.trend.value,
+        "action": result.action.value,
+        "confidence": result.confidence,
+        "payload": payload,
+        "image_uri": image_uri,
+        "outcome_return": None,
+    }
+
+
 @app.post("/api/v1/parse-image")
 async def parse_image(symbol: str, timeframe: str, image: UploadFile = File(...)) -> dict:
     data = await image.read()
@@ -117,7 +160,8 @@ async def parse_image(symbol: str, timeframe: str, image: UploadFile = File(...)
 
 @app.post("/api/v1/decision", response_model=DecisionResult)
 def decision(req: DecisionRequest) -> DecisionResult:
-    return hybrid_decision(req)
+    result, _ = run_decision_pipeline(req)
+    return result
 
 
 @app.post("/api/v1/decision/multi")
@@ -126,30 +170,22 @@ def decision_multi(req: DecisionRequest) -> dict:
     return {"strategies": {k: v.model_dump() for k, v in decisions.items()}}
 
 
-
-
 @app.post("/api/v1/signal-from-oss-image")
 async def signal_from_oss_image(req: OssImageSignalRequest) -> dict:
     image_data = _download_image_from_url(req.image_url)
     parsed = parse_image_with_parallel_vision_models(image_data, symbol=req.symbol, timeframe=req.timeframe)
-    decision_req = DecisionRequest(parsed=parsed, position=req.position)
+    decision_req = DecisionRequest(parsed=parsed, position=req.position, asset_class=req.asset_class)
     result = hybrid_decision_from_images(decision_req, image_payloads=[(image_data, req.timeframe)])
 
-    record = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "symbol": parsed.symbol,
-        "timeframe": parsed.timeframe,
-        "position": req.position,
-        "trend": result.trend.value,
-        "action": result.action.value,
-        "confidence": result.confidence,
-        "payload": {
+    record = _build_signal_record(
+        decision_req,
+        result,
+        {
             "parsed": parsed.model_dump(),
             "decision": result.model_dump(),
         },
-        "image_uri": req.image_url,
-        "outcome_return": None,
-    }
+        image_uri=req.image_url,
+    )
     signal_id = insert_signal(record)
     return {"signal_id": signal_id, "parsed": parsed, "decision": result}
 
@@ -159,30 +195,25 @@ async def signal_from_image(
     symbol: str,
     timeframe: str,
     position: Annotated[str, Query(pattern="^(flat|long|short)$")] = "flat",
+    asset_class: AssetClass = AssetClass.cn_futures,
     image: UploadFile = File(...),
 ) -> dict:
     data = await image.read()
     parsed = parse_image_with_parallel_vision_models(data, symbol=symbol, timeframe=timeframe)
-    req = DecisionRequest(parsed=parsed, position=position)
-    result = hybrid_decision_from_images(req, image_payloads=[(data, timeframe)])
+    req = DecisionRequest(parsed=parsed, position=position, asset_class=asset_class)
+    result, runtime_meta = run_decision_pipeline(req)
 
-    record = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "symbol": parsed.symbol,
-        "timeframe": parsed.timeframe,
-        "position": position,
-        "trend": result.trend.value,
-        "action": result.action.value,
-        "confidence": result.confidence,
-        "payload": {
+    record = _build_signal_record(
+        req,
+        result,
+        {
             "parsed": parsed.model_dump(),
             "decision": result.model_dump(),
+            "runtime": runtime_meta,
         },
-        "image_uri": None,
-        "outcome_return": None,
-    }
+    )
     signal_id = insert_signal(record)
-    return {"signal_id": signal_id, "parsed": parsed, "decision": result}
+    return {"signal_id": signal_id, "parsed": parsed, "decision": result, "runtime": runtime_meta}
 
 
 @app.post("/api/v1/signal-from-image/multi")
@@ -190,11 +221,12 @@ async def signal_from_image_multi(
     symbol: str,
     timeframe: str,
     position: Annotated[str, Query(pattern="^(flat|long|short)$")] = "flat",
+    asset_class: AssetClass = AssetClass.cn_futures,
     image: UploadFile = File(...),
 ) -> dict:
     data = await image.read()
     parsed = parse_image_with_parallel_vision_models(data, symbol=symbol, timeframe=timeframe)
-    req = DecisionRequest(parsed=parsed, position=position)
+    req = DecisionRequest(parsed=parsed, position=position, asset_class=asset_class)
     decisions = hybrid_decision_from_images_multi(req, image_payloads=[(data, timeframe)])
     return {"parsed": parsed, "strategies": {k: v.model_dump() for k, v in decisions.items()}}
 
@@ -204,6 +236,7 @@ async def signal_from_images(
     symbol: str,
     timeframes: str,
     position: str = "flat",
+    asset_class: AssetClass = AssetClass.cn_futures,
     images: list[UploadFile] = File(...),
 ) -> dict:
     frames = [f.strip() for f in timeframes.split(",") if f.strip()]
@@ -218,30 +251,26 @@ async def signal_from_images(
 
     parsed_list = parse_images_with_parallel_vision_models(payloads, symbol=symbol)
     fused_parsed = fuse_parsed_signals(parsed_list)
-    req = DecisionRequest(parsed=fused_parsed, position=position)
-    result = hybrid_decision_from_images(req, image_payloads=payloads)
+    req = DecisionRequest(parsed=fused_parsed, position=position, asset_class=asset_class)
+    result, runtime_meta = run_decision_pipeline(req)
 
-    record = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "symbol": symbol,
-        "timeframe": f"fusion({','.join(frames)})",
-        "position": position,
-        "trend": result.trend.value,
-        "action": result.action.value,
-        "confidence": result.confidence,
-        "payload": {
+    record = _build_signal_record(
+        req,
+        result,
+        {
             "parsed_list": [p.model_dump() for p in parsed_list],
             "fused_parsed": fused_parsed.model_dump(),
             "decision": result.model_dump(),
+            "runtime": runtime_meta,
         },
-        "outcome_return": None,
-    }
+    )
     signal_id = insert_signal(record)
     return {
         "signal_id": signal_id,
         "parsed_list": parsed_list,
         "fused_parsed": fused_parsed,
         "decision": result,
+        "runtime": runtime_meta,
     }
 
 

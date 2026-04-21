@@ -56,12 +56,20 @@ def test_signal_from_images_returns_single_decision(monkeypatch):
         ],
     )
     monkeypatch.setattr(
-        "app.main.hybrid_decision_from_images",
-        lambda req, image_payloads: DecisionResult(
-            trend="bearish",
-            action="wait",
-            reason=["ok"],
-            confidence=0.66,
+        "app.main.run_decision_pipeline",
+        lambda req: (
+            DecisionResult(
+                trend="bearish",
+                action="wait",
+                reason=["ok"],
+                confidence=0.66,
+                risk_verdict="risk_policy:ok",
+            ),
+            {
+                "strategy": "hybrid_vision_v1",
+                "execution": {"status": "noop", "side": "none", "qty": 0.0, "note": "no execution required"},
+                "risk_verdict": "risk_policy:ok",
+            },
         ),
     )
     monkeypatch.setattr("app.main.insert_signal", lambda record: 1)
@@ -79,3 +87,4 @@ def test_signal_from_images_returns_single_decision(monkeypatch):
     body = resp.json()
     assert body["decision"]["action"] == "wait"
     assert len(body["parsed_list"]) == 2
+    assert body["runtime"]["risk_verdict"] == "risk_policy:ok"

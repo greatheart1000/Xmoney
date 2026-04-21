@@ -1,2 +1,15 @@
 __pycache__/
 *.pyc
+*.pyo
+.env
+data/
+reports/
+logs/
+.idea/
+.runtime/
+*.db
+*.egg-info/
+dist/
+build/
+reference_projects/
+third_party_repos/

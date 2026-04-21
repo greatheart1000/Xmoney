@@ -1,0 +1,38 @@
+# Repo manifest template for tools/fetch_repos.sh
+#
+# One repository per line, using pipe-delimited fields:
+#   repo_url|relative_dir|branch
+#
+# Rules:
+# 1) Empty lines and lines starting with # are ignored.
+# 2) relative_dir and branch are optional.
+# 3) If relative_dir is empty, fetch script auto-generates directory name from URL.
+# 4) Keep relative_dir unique to avoid collisions.
+#
+# Suggested root when fetching:
+#   ./third_party_repos/
+#
+# Example categories: domestic futures, crypto futures, stocks, options.
+
+# ------------------------------
+# Domestic Futures (China)
+# ------------------------------
+# https://github.com/ORG/PROJECT_A|cn_futures/PROJECT_A|main
+
+# ------------------------------
+# Crypto / Futures
+# ------------------------------
+# https://github.com/ORG/PROJECT_B|crypto/PROJECT_B|main
+
+# ------------------------------
+# Stocks / Multi-Asset
+# ------------------------------
+# https://github.com/ORG/PROJECT_C|stocks/PROJECT_C|master
+
+# ------------------------------
+# Options / Derivatives
+# ------------------------------
+# https://github.com/ORG/PROJECT_D|options/PROJECT_D|main
+
+# Minimal form (only URL):
+# https://github.com/ORG/PROJECT_E

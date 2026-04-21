@@ -20,6 +20,14 @@ class MarketRegime(str, Enum):
     unknown = "unknown"
 
 
+class AssetClass(str, Enum):
+    cn_futures = "cn_futures"
+    crypto = "crypto"
+    equity = "equity"
+    options = "options"
+    multi = "multi"
+
+
 class SignalAction(str, Enum):
     wait = "wait"
     long = "long"
@@ -65,6 +73,10 @@ class DecisionRequest(BaseModel):
     parsed: ParsedImageSignal
     position: str = Field(default="flat", pattern="^(flat|long|short)$")
     risk_per_trade: float = Field(default=0.01, ge=0.001, le=0.05)
+    asset_class: AssetClass = AssetClass.cn_futures
+    exchange: str = "SIM"
+    instrument_type: str = "futures"
+    strategy_id: str = "hybrid_vision_v1"
     market_regime_30m: MarketRegime = MarketRegime.unknown
     market_regime_15m: MarketRegime = MarketRegime.unknown
     require_market_filter: bool = True
@@ -83,6 +95,12 @@ class DecisionResult(BaseModel):
     is_high_quality_setup: bool = False
     ai_decision_report: Optional[str] = None
     confidence: float
+    risk_verdict: Optional[str] = None
+    risk_level: Optional[str] = None
+    position_sizing: Optional[float] = None
+    trailing_stop: Optional[float] = None
+    trend_strength: Optional[str] = None
+    indicators_used: List[str] = Field(default_factory=list)
 
 
 class SignalRecord(BaseModel):
@@ -141,3 +159,4 @@ class OssImageSignalRequest(BaseModel):
     timeframe: str
     image_url: str
     position: str = Field(default="flat", pattern="^(flat|long|short)$")
+    asset_class: AssetClass = AssetClass.cn_futures

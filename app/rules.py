@@ -1,9 +1,197 @@
+"""规则引擎 - 纯规则驱动的交易信号生成。
+
+v2.0 优化内容:
+- 趋势强度分级（通过ADX+MA排列综合判断），影响信号置信度
+- 震荡市检测（ADX < 20 + 布林带收窄 → 不开新仓）
+- 改进多时间框架确认逻辑（趋势一致性评分）
+"""
 from __future__ import annotations
 
 from typing import List, Tuple
 
 from .models import DecisionRequest, DecisionResult, MarketRegime, SignalAction, Trend
 
+
+# ==================== 趋势强度分级 ====================
+
+def _trend_strength_grade(req: DecisionRequest) -> Tuple[str, float]:
+    """趋势强度分级，影响信号置信度。
+
+    综合ADX值和MA排列紧密程度，将趋势分为：
+    - "strong": ADX > 30 且 MA完美排列 → 置信度+0.10
+    - "moderate": ADX 25-30 或 MA大部分排列 → 置信度+0.05
+    - "weak": ADX 20-25 且 MA部分排列 → 置信度不变
+    - "ranging": ADX < 20 → 置信度-0.10
+
+    返回 (强度标签, 置信度调整系数)。
+    """
+    p = req.parsed
+
+    # 尝试获取ADX值
+    adx_val = None
+    if p.raw_features.get("adx_14"):
+        try:
+            adx_val = float(p.raw_features["adx_14"])
+        except (ValueError, TypeError):
+            pass
+
+    # MA排列检测
+    ma_bull = p.ma5 > p.ma10 > p.ma20 > p.ma40 > p.ma60
+    ma_bear = p.ma5 < p.ma10 < p.ma20 < p.ma40 < p.ma60
+    ma_partial_bull = p.ma5 > p.ma20 > p.ma60
+    ma_partial_bear = p.ma5 < p.ma20 < p.ma60
+
+    has_ma_align = ma_bull or ma_bear
+    has_partial_align = ma_partial_bull or ma_partial_bear
+
+    if adx_val is not None:
+        if adx_val > 30 and has_ma_align:
+            return "strong", 0.10
+        if adx_val > 25 and (has_ma_align or has_partial_align):
+            return "moderate", 0.05
+        if adx_val > 20:
+            return "weak", 0.0
+        return "ranging", -0.10
+
+    # 无ADX数据时，根据MA排列判断
+    if has_ma_align:
+        return "moderate", 0.05
+    if has_partial_align:
+        return "weak", 0.0
+    return "ranging", -0.10
+
+
+# ==================== 震荡市检测 ====================
+
+def _is_ranging_market(req: DecisionRequest) -> Tuple[bool, List[str]]:
+    """震荡市检测。
+
+    综合判断条件:
+    1. ADX < 20（趋势强度不足）
+    2. 布林带宽度收窄（波动率压缩）
+
+    在震荡市中不建议开新仓，避免被假突破止损。
+
+    返回 (是否为震荡市, 原因列表)。
+    """
+    p = req.parsed
+    notes: List[str] = []
+
+    # ADX检测
+    adx_val = None
+    if p.raw_features.get("adx_14"):
+        try:
+            adx_val = float(p.raw_features["adx_14"])
+        except (ValueError, TypeError):
+            pass
+
+    if adx_val is None or adx_val >= 20:
+        return False, notes
+
+    # ADX < 20，检查布林带宽度
+    boll_upper = p.raw_features.get("boll_upper")
+    boll_lower = p.raw_features.get("boll_lower")
+
+    boll_narrow = False
+    if boll_upper and boll_lower:
+        try:
+            width_pct = (float(boll_upper) - float(boll_lower)) / p.close * 100
+            if width_pct < 2.5:
+                boll_narrow = True
+                notes.append(f"布林带收窄（宽度{width_pct:.1f}%），波动率压缩")
+        except (ValueError, TypeError):
+            pass
+
+    if adx_val < 20:
+        notes.append(f"ADX={adx_val:.1f} < 20，趋势强度不足")
+        if boll_narrow:
+            notes.append("震荡市确认：ADX低迷 + 布林带收窄，不建议开新仓")
+            return True, notes
+        # ADX低但布林带未极端收窄，仅发出警告
+        notes.append("趋势强度偏弱，谨慎操作")
+
+    return False, notes
+
+
+# ==================== 多时间框架确认 ====================
+
+def _multi_timeframe_confirmation(req: DecisionRequest, trend: Trend) -> Tuple[float, List[str]]:
+    """改进的多时间框架确认逻辑。
+
+    通过多个维度的趋势一致性评分来增强信号可靠性：
+    1. MA排列一致性（短期/中期/长期MA方向一致）
+    2. MACD方向与趋势一致
+    3. 价格位置与趋势一致（在关键均线上方/下方）
+    4. 成交量确认（量价配合）
+
+    每个维度通过得1分，满分4分。
+    - 4分: 高度一致，置信度+0.10
+    - 3分: 基本一致，置信度+0.05
+    - 2分: 部分一致，置信度不变
+    - 1分: 一致性差，置信度-0.05
+    - 0分: 矛盾信号，置信度-0.15
+
+    返回 (置信度调整, 原因列表)。
+    """
+    p = req.parsed
+    notes: List[str] = []
+    score = 0
+
+    if trend == Trend.neutral:
+        return 0.0, notes
+
+    # 1. MA排列一致性
+    if trend == Trend.bullish:
+        if p.ma5 > p.ma10 > p.ma20:
+            score += 1
+            notes.append("短中期MA多头排列一致")
+    else:
+        if p.ma5 < p.ma10 < p.ma20:
+            score += 1
+            notes.append("短中期MA空头排列一致")
+
+    # 2. MACD方向一致
+    if trend == Trend.bullish and p.macd_hist > 0 and p.macd_diff > p.macd_dea:
+        score += 1
+        notes.append("MACD方向与多头趋势一致")
+    elif trend == Trend.bearish and p.macd_hist < 0 and p.macd_diff < p.macd_dea:
+        score += 1
+        notes.append("MACD方向与空头趋势一致")
+
+    # 3. 价格位置一致
+    if trend == Trend.bullish and p.close > p.ma40 and p.close > p.ma60:
+        score += 1
+        notes.append("价格位于中长期均线上方，多头确认")
+    elif trend == Trend.bearish and p.close < p.ma40 and p.close < p.ma60:
+        score += 1
+        notes.append("价格位于中长期均线下方，空头确认")
+
+    # 4. 成交量确认
+    vol_ratio = None
+    if p.raw_features.get("volume_ratio"):
+        try:
+            vol_ratio = float(p.raw_features["volume_ratio"])
+        except (ValueError, TypeError):
+            pass
+
+    if vol_ratio is not None:
+        if trend == Trend.bullish and vol_ratio > 1.0:
+            score += 1
+            notes.append(f"放量配合多头（量比{vol_ratio:.1f}）")
+        elif trend == Trend.bearish and vol_ratio > 1.0:
+            score += 1
+            notes.append(f"放量配合空头（量比{vol_ratio:.1f}）")
+
+    # 评分转置信度调整
+    adjustments = {4: 0.10, 3: 0.05, 2: 0.0, 1: -0.05, 0: -0.15}
+    adj = adjustments.get(score, 0.0)
+
+    notes.append(f"多时间框架确认评分: {score}/4（置信度调整{adj:+.2f}）")
+
+    return adj, notes
+
+
+# ==================== 原有辅助函数 ====================
 
 def _infer_trend(req: DecisionRequest) -> Trend:
     p = req.parsed
@@ -85,7 +273,7 @@ def _fib_time_and_move_projection(req: DecisionRequest, trend: Trend) -> Tuple[i
 
     expected_move: float | None = None
     if avg_move is not None and p.leg_start_price and p.leg_start_price > 0:
-        # 给出本波段“历史平均总涨跌幅”参考
+        # 给出本波段"历史平均总涨跌幅"参考
         expected_move = -abs(avg_move) if trend == Trend.bearish else abs(avg_move)
         notes.append("已结合历史平均波段涨跌幅评估空间")
 
@@ -124,12 +312,29 @@ def _merge_support_resistance(req: DecisionRequest, trend: Trend) -> Tuple[List[
     return sorted(support), sorted(resistance), notes
 
 
+# ==================== 主决策函数 ====================
+
 def make_decision(req: DecisionRequest) -> DecisionResult:
+    """规则引擎主决策函数（v2.0）。
+
+    优化内容:
+    1. 趋势强度分级影响信号置信度
+    2. 震荡市检测（不开新仓）
+    3. 改进多时间框架确认逻辑
+    """
     p = req.parsed
     trend = _infer_trend(req)
     reason: List[str] = []
     if p.chart_patterns:
         reason.append(f"识别到形态: {', '.join(p.chart_patterns[:3])}")
+
+    # === 新增：趋势强度分级 ===
+    strength, strength_adj = _trend_strength_grade(req)
+    reason.append(f"趋势强度: {strength}")
+
+    # === 新增：震荡市检测 ===
+    is_ranging, ranging_notes = _is_ranging_market(req)
+    reason.extend(ranging_notes)
 
     market_dir = _market_direction(req)
     if req.require_market_filter:
@@ -139,6 +344,7 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
                 action=SignalAction.wait,
                 reason=["文华指数过滤未提供，按市场优先原则先观望"],
                 confidence=max(0.2, p.confidence - 0.25),
+                trend_strength=strength,
             )
         if market_dir == MarketRegime.neutral:
             return DecisionResult(
@@ -146,6 +352,7 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
                 action=SignalAction.wait,
                 reason=["文华指数30m与15m未同向，按市场优先原则先观望"],
                 confidence=max(0.25, p.confidence - 0.2),
+                trend_strength=strength,
             )
         reason.append(f"文华指数方向确认: {market_dir.value}")
 
@@ -156,6 +363,13 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
     remaining_bars, expected_move_pct, projection_notes = _fib_time_and_move_projection(req, trend)
     reason.extend(fib_notes)
     reason.extend(projection_notes)
+
+    # === 新增：多时间框架确认评分 ===
+    mtf_adj, mtf_notes = _multi_timeframe_confirmation(req, trend)
+    reason.extend(mtf_notes)
+
+    # 综合置信度调整
+    total_adj = strength_adj + mtf_adj
 
     if trend == Trend.bearish:
         reason.append("单品种MA空头排列且价格位于中长期均线下方")
@@ -170,6 +384,19 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
                 expected_remaining_bars=remaining_bars,
                 expected_total_move_pct=expected_move_pct,
                 confidence=max(0.3, p.confidence - 0.15),
+                trend_strength=strength,
+            )
+
+        # === 新增：震荡市不开新仓 ===
+        if is_ranging and req.position == "flat":
+            return DecisionResult(
+                trend=trend,
+                action=SignalAction.wait,
+                reason=reason + ["震荡市检测触发，不开新空仓"],
+                expected_remaining_bars=remaining_bars,
+                expected_total_move_pct=expected_move_pct,
+                confidence=max(0.3, p.confidence + total_adj - 0.1),
+                trend_strength=strength,
             )
 
         if req.position == "long":
@@ -180,7 +407,8 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
                 stop_loss=(support[0] * 0.997 if support else p.close * 0.995),
                 expected_remaining_bars=remaining_bars,
                 expected_total_move_pct=expected_move_pct,
-                confidence=min(0.9, p.confidence + 0.1),
+                confidence=min(0.9, p.confidence + 0.1 + total_adj),
+                trend_strength=strength,
             )
         if req.position == "short":
             return DecisionResult(
@@ -191,7 +419,8 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
                 take_profit=support or [p.close * 0.99],
                 expected_remaining_bars=remaining_bars,
                 expected_total_move_pct=expected_move_pct,
-                confidence=min(0.92, p.confidence + 0.08),
+                confidence=min(0.92, p.confidence + 0.08 + total_adj),
+                trend_strength=strength,
             )
         return DecisionResult(
             trend=trend,
@@ -202,7 +431,8 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
             take_profit=support or [p.close * 0.99, p.close * 0.985],
             expected_remaining_bars=remaining_bars,
             expected_total_move_pct=expected_move_pct,
-            confidence=min(0.9, p.confidence + 0.05),
+            confidence=min(0.9, p.confidence + 0.05 + total_adj),
+            trend_strength=strength,
         )
 
     if trend == Trend.bullish:
@@ -218,6 +448,19 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
                 expected_remaining_bars=remaining_bars,
                 expected_total_move_pct=expected_move_pct,
                 confidence=max(0.3, p.confidence - 0.15),
+                trend_strength=strength,
+            )
+
+        # === 新增：震荡市不开新仓 ===
+        if is_ranging and req.position == "flat":
+            return DecisionResult(
+                trend=trend,
+                action=SignalAction.wait,
+                reason=reason + ["震荡市检测触发，不开新多仓"],
+                expected_remaining_bars=remaining_bars,
+                expected_total_move_pct=expected_move_pct,
+                confidence=max(0.3, p.confidence + total_adj - 0.1),
+                trend_strength=strength,
             )
 
         if req.position == "short":
@@ -228,7 +471,8 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
                 stop_loss=(resistance[-1] * 1.003 if resistance else p.close * 1.005),
                 expected_remaining_bars=remaining_bars,
                 expected_total_move_pct=expected_move_pct,
-                confidence=min(0.9, p.confidence + 0.1),
+                confidence=min(0.9, p.confidence + 0.1 + total_adj),
+                trend_strength=strength,
             )
         if req.position == "long":
             return DecisionResult(
@@ -239,7 +483,8 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
                 take_profit=resistance or [p.close * 1.01],
                 expected_remaining_bars=remaining_bars,
                 expected_total_move_pct=expected_move_pct,
-                confidence=min(0.92, p.confidence + 0.08),
+                confidence=min(0.92, p.confidence + 0.08 + total_adj),
+                trend_strength=strength,
             )
         return DecisionResult(
             trend=trend,
@@ -250,7 +495,8 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
             take_profit=resistance or [p.close * 1.01, p.close * 1.015],
             expected_remaining_bars=remaining_bars,
             expected_total_move_pct=expected_move_pct,
-            confidence=min(0.9, p.confidence + 0.05),
+            confidence=min(0.9, p.confidence + 0.05 + total_adj),
+            trend_strength=strength,
         )
 
     reason.append("单品种均线和MACD未形成一致性，等待更清晰信号")
@@ -260,5 +506,6 @@ def make_decision(req: DecisionRequest) -> DecisionResult:
         reason=reason,
         expected_remaining_bars=remaining_bars,
         expected_total_move_pct=expected_move_pct,
-        confidence=max(0.3, p.confidence - 0.2),
+        confidence=max(0.3, p.confidence - 0.2 + total_adj),
+        trend_strength=strength,
     )
